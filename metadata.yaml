@@ -2,9 +2,9 @@ name: astrbot_plugin_all_memory
 display_name: 全量记忆体
 desc: 三层记忆：只追加原始层（永不删改）+ 可重算提炼层（带出处）+ 可重建索引层。不为省钱优化，token 优先。
 short_desc: 原话永不删改；裁剪时提炼人物卡，需要时按关键词检索回来
-version: 0.9.13
+version: 0.9.14
 author: mingyu
-repo: ""
+repo: "https://github.com/mingyu011/astrbot_plugin_all_memory"
 support_platforms:
   - aiocqhttp
   - qq_official
