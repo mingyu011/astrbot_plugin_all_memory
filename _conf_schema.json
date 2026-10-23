@@ -1,0 +1,69 @@
+{
+  "enabled": {
+    "description": "总开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关掉之后既不归档，也不接管上下文。"
+  },
+  "window_tokens": {
+    "description": "上下文窗口",
+    "type": "int",
+    "default": 0,
+    "hint": "填模型真实的窗口大小，单位 token，例如 128000 或 1000000。填 0 = 只存档、对话完全不改（默认）。填小了会疯狂裁剪，填大了该裁不裁。",
+    "obvious_hint": true
+  },
+  "data_dir": {
+    "description": "数据目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空 = AstrBot 数据目录下的 all_memory。想放到别的盘再填绝对路径。"
+  },
+  "trigger_ratio": {
+    "description": "触发裁剪的比例",
+    "type": "float",
+    "default": 0.8,
+    "hint": "上下文占到窗口多少才动手，默认 0.80（80%）。必须小于 AstrBot 内置的 0.82。"
+  },
+  "total_ratio": {
+    "description": "裁剪后压到多少",
+    "type": "float",
+    "default": 0.4,
+    "hint": "裁完之后整个请求的目标大小，默认 0.40（40%）。里面还要装人物卡、地图、检索，历史拿剩下的部分。"
+  },
+  "map_days": {
+    "description": "地图按天列出",
+    "type": "int",
+    "default": 365,
+    "hint": "最近多少天按天列，更早的按月汇总。地图本身覆盖全部历史，不会砍掉早期记忆。"
+  },
+  "recall_limit": {
+    "description": "每轮检索条数上限",
+    "type": "int",
+    "default": 50,
+    "hint": "安全上限，防止配错。实际装几条由 5% 预算决定，装满为止。"
+  },
+  "extract_chunk_chars": {
+    "description": "提炼每批字数",
+    "type": "int",
+    "default": 6000,
+    "hint": "批数 = 全部正文字数 ÷ 它，不设上限，历史多长都全部读完。调小 = 调用更多、每次更短；调大 = 调用更少、每次更长。"
+  },
+  "dry_run": {
+    "description": "演练模式",
+    "type": "bool",
+    "default": false,
+    "hint": "只把「本来会怎么裁」写进日志，不改任何内容。想先看效果再动手时打开。"
+  },
+  "auto_export_at": {
+    "description": "每天定时导出",
+    "type": "string",
+    "default": "",
+    "hint": "填 HH:MM（例如 03:00）就每天到点自动打包一次，留空不自动导出。"
+  },
+  "export_keep": {
+    "description": "保留几个导出包",
+    "type": "int",
+    "default": 0,
+    "hint": "0 = 不限、永不自动删。填 N 就只留最近 N 个，更早的自动清掉。"
+  }
+}
