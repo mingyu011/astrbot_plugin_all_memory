@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>全量记忆体</title>
-  <link rel="stylesheet" href="./style.css?v=0.9.14" />
+  <link rel="stylesheet" href="./style.css?v=1.0.0" />
 </head>
 <body>
   <header class="topbar">
@@ -14,9 +14,12 @@
       <span class="sub">原始层 · 提炼层 · 检索层</span>
     </div>
     <div class="actions">
+      <button id="btn-takeover" class="ghost"
+              title="全局：开了所有会话都注入记忆；默认关，首次裁剪自动开">全局接管：关（自动）</button>
       <button id="btn-summary" class="ghost">生成纪要</button>
       <button id="btn-refine" class="ghost">提炼事实</button>
       <button id="btn-import" class="ghost">导入备份</button>
+      <button id="btn-verify-m" class="ghost" title="校验当前数据的 manifest 与完整性">校验记忆体</button>
       <button id="btn-export" class="primary">一键保存全量数据</button>
     </div>
   </header>
@@ -137,6 +140,6 @@
   </div>
 
   <div id="toast" class="toast" hidden></div>
-  <script type="module" src="./app.js?v=0.9.14"></script>
+  <script type="module" src="./app.js?v=1.1.0"></script>
 </body>
 </html>

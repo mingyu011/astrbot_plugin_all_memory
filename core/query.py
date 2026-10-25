@@ -20,12 +20,16 @@ import os
 import re
 from datetime import datetime, timedelta
 
+from .ids import safe_component
+
 TZ_OFFSET = 8  # 只用来判断"日期区间"，不参与展示
 
 # 单字虚词：拆出来对检索没帮助，反而到处命中
 STOPWORDS = set(
     "我 你 他 她 它 们 的 了 吗 呢 吧 啊 呀 是 在 有 就 都 也 和 跟 说 这 那 不 要 会 能 "
-    "个 一 上 下 好 很 太 还 又 把 被 给 得 地 着 过 让 但 而 与 或 如果 因为 所以 可以".split()
+    "个 一 上 下 好 很 太 还 又 把 被 给 得 地 着 过 让 但 而 与 或 如果 因为 所以 可以 "
+    "什么 怎么 为什么 哪里 哪儿 几点 多少 哪些 哪个 现在 最近 平时 一次 时候 那天 "
+    "今天 昨天 知道 记得 说过 一个 有没有 是不是 什么 怎么 为什么".split()
 )
 
 _SPLIT_RE = re.compile(r"[\s，。！？、；：,\.\!\?;:~…\-—\"'“”‘’（）()\[\]【】{}<>《》/\\|]+")
@@ -37,9 +41,32 @@ RELATIVE = {
     "前天": -2, "大前天": -3, "明天": 1,
 }
 
+# 这些词在检索里太泛，命中它们不代表命中问题；只在还有别的词时丢弃。
+GENERIC_TERMS = {
+    "小木", "主人", "用户", "助手", "什么", "怎么", "为什么", "最近",
+    "平时", "现在", "时候", "那天", "一次", "知道", "记得", "说过",
+}
+
+_ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+
 
 def normalize(text: str) -> str:
     return " ".join(str(text or "").split()).strip()
+
+
+def _bigrams(chunk: str, limit: int = 10) -> list[str]:
+    """两字窗口，补 trigram 覆盖不到的短词。"""
+    chars = [c for c in chunk if "\u4e00" <= c <= "\u9fff"]
+    if len(chars) < 2:
+        return []
+    grams: list[str] = []
+    for start in range(0, len(chars) - 1):
+        gram = "".join(chars[start:start + 2])
+        if gram not in grams:
+            grams.append(gram)
+        if len(grams) >= limit:
+            break
+    return grams
 
 
 def _trigrams(chunk: str, limit: int = 4) -> list[str]:
@@ -70,7 +97,11 @@ def split_terms(text: str, limit: int = 8) -> list[str]:
     中文没有分词器，这里不追求语言学正确——检索词是"用来查的原料"，
     宁可多切几段，也不要整句当关键词。
     """
-    chunks = [c.strip() for c in _SPLIT_RE.split(normalize(text)) if c.strip()]
+    body = normalize(text)
+    # “B 站”“A7M4 相机”这种空格会把一个词拆成两个；先粘回去再切。
+    body = re.sub(r"(?<=[A-Za-z0-9])\s+(?=[\u3400-\u9fff])", "", body)
+    body = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[A-Za-z0-9])", "", body)
+    chunks = [c.strip() for c in _SPLIT_RE.split(body) if c.strip()]
     terms: list[str] = []
     seen = set()
 
@@ -84,11 +115,23 @@ def split_terms(text: str, limit: int = 8) -> list[str]:
         terms.append(value[:24])
 
     for chunk in chunks:
-        push(chunk)
-        # 一段太长时，整段当关键词基本不会有命中，补几个三字窗口
+        # 很长的中文整句当 phrase 基本不会命中；英文/型号/编号整词必须保留。
+        has_cjk = any("\u3400" <= ch <= "\u9fff" for ch in chunk)
+        if len(chunk) <= 4 or not has_cjk:
+            push(chunk)
+        for word in _ASCII_WORD_RE.findall(chunk):
+            push(word)
+        for gram in _bigrams(chunk):
+            push(gram)
+        # 一段太长时，整段当关键词基本不会有命中，补几个三字窗口。
         if len(chunk) >= 4:
             for gram in _trigrams(chunk):
                 push(gram)
+
+    if len(terms) > 2:
+        filtered = [t for t in terms if t not in GENERIC_TERMS]
+        if filtered:
+            terms = filtered
     return terms[:max(1, limit)]
 
 
@@ -155,6 +198,52 @@ def is_earliest_intent(text: str) -> bool:
     return any(word in body for word in _EARLIEST_WORDS)
 
 
+_YES_NO_MARKERS = ("吗", "是否", "有没有", "是不是")
+
+# 问句里的“话题词”提取：先去掉这些人称、动词、疑问词，剩下的才是
+# “咖啡 / 猫 / 相机”这种真正需要证据的名词。
+_TOPIC_DROP = set(
+    "小木 主人 用户 助手 我 你 他 她 它 我们 你们 他们 她们 "
+    "喜欢 爱 讨厌 养过 养 喝 吃 去 有 会 能 想 要 "
+    "记得 知道 是不是 有没有 是否 吗 呢 吧 啊 呀 了 的 过".split()
+)
+
+
+def is_yes_no(text: str) -> bool:
+    """是不是一个 yes/no 问句（“喜欢咖啡吗 / 养过猫吗”）。"""
+    body = normalize(text)
+    return any(marker in body for marker in _YES_NO_MARKERS)
+
+
+def topic_terms(text: str, limit: int = 6) -> list[str]:
+    """
+    粗抽 yes/no 问句里的话题词。
+
+    例：
+      “小木喜欢喝咖啡吗” → ["咖啡"]
+      “小木养过猫吗”     → ["猫"]
+
+    只用于“命中必须包含话题词”的证据过滤；抽不出来就返回空，
+    调用方不做过滤，宁可少拦也不误杀。
+    """
+    body = normalize(text).replace("？", " ").replace("?", " ")
+    for word in sorted(_TOPIC_DROP, key=len, reverse=True):
+        body = body.replace(word, " ")
+    chunks = [chunk.strip() for chunk in _SPLIT_RE.split(body) if chunk.strip()]
+    out: list[str] = []
+    for chunk in chunks:
+        for particle in ("吗", "呢", "吧", "啊", "呀", "了", "的", "过"):
+            chunk = chunk.replace(particle, "")
+        chunk = chunk.strip()
+        if not chunk or chunk in STOPWORDS:
+            continue
+        if chunk not in out:
+            out.append(chunk[:24])
+        if len(out) >= max(1, int(limit or 6)):
+            break
+    return out
+
+
 def build_terms(text: str, expansions: list[str] | None = None,
                 limit: int = 8) -> list[str]:
     """
@@ -186,8 +275,9 @@ class QueryCache:
 
     VERSION = "v1"
 
-    def __init__(self, root: str):
-        self.dir = os.path.join(root, "cache", "query")
+    def __init__(self, root: str, uid: str = "default"):
+        self.dir = os.path.join(root, "cache", "query",
+                                safe_component(uid, fallback="default"))
         os.makedirs(self.dir, exist_ok=True)
 
     def _path(self, text: str) -> str:

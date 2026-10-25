@@ -20,8 +20,11 @@ import json
 import time
 import random
 import shutil
+import re
+import difflib
 from datetime import datetime, timedelta, timezone
 
+from .ids import safe_component
 from .vault import fp_of, now
 from .tokens import estimate_tokens
 
@@ -91,34 +94,37 @@ EXTRACT_PROMPT = """你在整理一段对话里的长期记忆。
 
 
 class FactStore:
-    """facts/ 目录，每条事实一个 JSON，可多版本。"""
+    """facts/<id>/ 目录，每条事实一个 JSON，可多版本。"""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, uid: str = "default"):
         self.root = root
-        self.dir = os.path.join(root, "facts")
-        self.archive_root = os.path.join(root, "facts_archive")
+        self.uid = safe_component(uid, fallback="default")
+        self.dir = os.path.join(root, "facts", self.uid)
+        self.archive_root = os.path.join(root, "facts_archive", self.uid)
+        self.staging = os.path.join(root, "facts_staging", self.uid)
         os.makedirs(self.dir, exist_ok=True)
 
     # ------------------------------------------------------------ 整体替换
 
     def replace_all(self, items: list[dict], model: str = "",
-                    scope: str = "session") -> int:
+                    scope: str = "session",
+                    prompt_version: str = "") -> int:
         """
         用一次完整提炼的结果替换整个 facts/。
 
-        因为提炼扫的是全量库，输出本来就覆盖上次的一切，所以不需要合并。
+        因为提炼扫的是这个 id 的全量库，输出本来就覆盖上次的一切，所以不需要合并。
         但必须保证安全：
 
           1. 先写到 facts_staging/
-          2. 旧目录整体移到 facts_archive/<时间戳>/
+          2. 旧目录整体移到 facts_archive/<id>/<时间戳>/
           3. 再把 staging 换上去
           4. 中途失败 → 把旧目录移回来，什么都不变
 
-        scope / subject：一条事实属于"谁"、能不能跨会话看见。
-        people = 关于某个人的长期事实（跨会话共享）；session = 只在出处那个会话里认。
+        scope / subject：一条事实属于"谁"、作用域是什么。0.9.17 起事实按 id 分文件夹，
+        这个字段保留但不再承担跨会话可见性；以后接群聊再启用。
         返回写入条数。
         """
-        staging = os.path.join(self.root, "facts_staging")
+        staging = self.staging
         if os.path.isdir(staging):
             shutil.rmtree(staging, ignore_errors=True)
         os.makedirs(staging, exist_ok=True)
@@ -143,6 +149,7 @@ class FactStore:
                     "source_fp": sources,
                     "extracted_at": stamp,
                     "model": model,
+                    "prompt_version": prompt_version,
                 }],
             }
             path = os.path.join(staging, f"{payload['id']}.json")
@@ -219,7 +226,7 @@ class FactStore:
 
     def latest(self) -> dict[str, dict]:
         """id -> 当前版本内容（含 kind / scope / subject）。"""
-        out = {}
+        items: list[dict] = []
         for fact in self.all_facts():
             versions = fact.get("versions") or []
             if versions:
@@ -228,8 +235,30 @@ class FactStore:
                 item["kind"] = normalize_kind(item.get("kind"))
                 item["scope"] = normalize_scope(fact.get("scope"))
                 item["subject"] = normalize_subject(fact.get("subject"))
-                out[fact["id"]] = item
-        return out
+                items.append(item)
+
+        # 旧数据里已经存在的近义事实，先在读取层合并掉，
+        # 这样即使还没跑 repair，注入到模型的卡也是干净的。
+        items.sort(key=lambda item: (str(item.get("extracted_at", "")),
+                                     str(item.get("id", ""))))
+        chosen: list[dict] = []
+        for item in items:
+            duplicate = False
+            for other in chosen:
+                exact = _normalize(item.get("claim", "")) == _normalize(
+                    other.get("claim", ""))
+                similar = (item["kind"] == other["kind"]
+                           and claim_similarity(item.get("claim", ""),
+                                                other.get("claim", ""))
+                           >= CLAIM_SIMILARITY)
+                if exact or similar:
+                    duplicate = True
+                    if other["kind"] == "fact" and item["kind"] != "fact":
+                        other["kind"] = item["kind"]
+                    break
+            if not duplicate:
+                chosen.append(item)
+        return {item["id"]: item for item in chosen}
 
     # ------------------------------------------------------------ 写
 
@@ -240,21 +269,34 @@ class FactStore:
             json.dump(fact, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
 
-    def _find_by_claim(self, claim: str) -> dict | None:
+    def _find_by_claim(self, claim: str, kind: str = "") -> dict | None:
         target = _normalize(claim)
+        wanted_kind = normalize_kind(kind) if kind else ""
+        best: tuple[float, dict | None] = (0.0, None)
         for fact in self.all_facts():
             versions = fact.get("versions") or []
-            if versions and _normalize(versions[-1].get("claim", "")) == target:
+            if not versions:
+                continue
+            current = versions[-1]
+            if _normalize(current.get("claim", "")) == target:
                 return fact
+            if wanted_kind and normalize_kind(current.get("kind")) != wanted_kind:
+                continue
+            score = claim_similarity(claim, current.get("claim", ""))
+            if score > best[0]:
+                best = (score, fact)
+        if best[1] is not None and best[0] >= CLAIM_SIMILARITY:
+            return best[1]
         return None
 
     def upsert(self, claim: str, source_fps: list[str],
                model: str = "", scope: str = "session",
-               kind: str = "fact") -> str:
+               kind: str = "fact", prompt_version: str = "") -> str:
         """
         新增或更新一条事实。返回 fact_id。
 
-        同一 claim 再次出现时，版本号 +1、来源合并，不覆盖旧版本。
+        同一 claim（或近义 claim）再次出现时，版本号 +1、来源合并，
+        不覆盖旧版本。
         """
         claim = claim.strip()
         if not claim:
@@ -265,7 +307,7 @@ class FactStore:
 
         stamp = now().isoformat(timespec="seconds")
 
-        existing = self._find_by_claim(claim)
+        existing = self._find_by_claim(claim, kind)
         if existing:
             versions = existing.setdefault("versions", [])
             latest = versions[-1] if versions else {}
@@ -277,6 +319,7 @@ class FactStore:
                 "source_fp": merged,
                 "extracted_at": stamp,
                 "model": model,
+                "prompt_version": prompt_version,
             })
             existing["deleted"] = False
             self._write(existing)
@@ -297,6 +340,7 @@ class FactStore:
                 "source_fp": source_fps,
                 "extracted_at": stamp,
                 "model": model,
+                "prompt_version": prompt_version,
             }],
         })
         return fact_id
@@ -322,6 +366,63 @@ class FactStore:
                 except OSError:
                     pass
         return count
+
+    def repair(self) -> dict:
+        """
+        合并已经存在的近义事实：保留最早的一条，其余标记 deleted 并写入 merged_into。
+
+        不删文件（仍可在面板/审计里看到）；latest() 只返回保留的那条。
+        """
+        facts = self.all_facts()
+        facts.sort(key=lambda fact: (
+            str(((fact.get("versions") or [{}])[-1]).get("extracted_at", "")),
+            str(fact.get("id", ""))))
+        groups: list[list[dict]] = []
+        for fact in facts:
+            versions = fact.get("versions") or []
+            if not versions:
+                continue
+            kind = normalize_kind(versions[-1].get("kind"))
+            claim = versions[-1].get("claim", "")
+            target = None
+            for group in groups:
+                current = (group[0].get("versions") or [{}])[-1]
+                if normalize_kind(current.get("kind")) != kind:
+                    continue
+                if claim_similarity(claim, current.get("claim", "")) >= CLAIM_SIMILARITY:
+                    target = group
+                    break
+            if target is None:
+                groups.append([fact])
+            else:
+                target.append(fact)
+
+        merged = 0
+        for group in groups:
+            if len(group) < 2:
+                continue
+            canonical = group[0]
+            can_versions = canonical.setdefault("versions", [])
+            if not can_versions:
+                continue
+            latest = can_versions[-1]
+            sources = list(latest.get("source_fp") or [])
+            for duplicate in group[1:]:
+                dup_versions = duplicate.get("versions") or []
+                if dup_versions:
+                    sources.extend(dup_versions[-1].get("source_fp") or [])
+                duplicate["deleted"] = True
+                duplicate["merged_into"] = canonical["id"]
+                duplicate["repaired_at"] = now().isoformat(timespec="seconds")
+                self._write(duplicate)
+                merged += 1
+            latest["source_fp"] = list(dict.fromkeys(sources))
+            canonical["deleted"] = False
+            canonical["repaired_at"] = now().isoformat(timespec="seconds")
+            self._write(canonical)
+
+        return {"ok": True, "facts": len(facts), "groups": len(groups),
+                "merged": merged}
 
     def _evict_one(self) -> None:
         """满了就淘汰最久没更新的一条（它仍在原始层里，可以重新提炼）。"""
@@ -415,6 +516,75 @@ def _normalize(text: str) -> str:
     return " ".join(str(text).split()).strip().lower()
 
 
+def _claim_key(text: str) -> str:
+    """归一化到“只比内容”的形态：去标点、统一 User/Bot 称呼。"""
+    body = _normalize(text)
+    body = re.sub(r"[\s，。！？、；：,.!?;:~…\-—\"'“”‘’（）()\[\]【】{}<>《》/\\|]+",
+                  "", body)
+    for old, new in (("用户", "主人"), ("对方", "主人"),
+                     ("她", "主人"), ("他", "主人"),
+                     ("小木", "助手"), ("机器人", "助手")):
+        body = body.replace(old, new)
+    return body
+
+
+_GENERIC_CLAIM_FEATURES = {
+    "主人", "助手", "喜欢", "的", "了", "是", "人喜", "手是",
+}
+
+
+def claim_similarity(left: str, right: str) -> float:
+    """两条 claim 是否在说同一件事；0~1。"""
+    a = _claim_key(left)
+    b = _claim_key(right)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        return 0.95
+
+    sequence = difflib.SequenceMatcher(None, a, b).ratio()
+
+    # 中文改写经常换语序/换虚词，字符序列相似度会偏低；
+    # 再用 2~3 字片段的重合度补一刀。
+    # 只共用“主人/助手/喜欢”这类泛词的（如“喜欢猫/喜欢狗”）不算同一件事。
+    def features(text: str) -> set[str]:
+        out: set[str] = set()
+        for run in re.findall(r"[\u3400-\u9fff]+", text):
+            if len(run) == 1:
+                out.add(run)
+            else:
+                for size in (2, 3):
+                    for start in range(len(run) - size + 1):
+                        out.add(run[start:start + size])
+        for word in re.findall(r"[a-z0-9]+", text):
+            if len(word) >= 2:
+                out.add(word)
+        return out
+
+    left_features = features(a)
+    right_features = features(b)
+    if not left_features or not right_features:
+        return sequence
+    shared = left_features & right_features
+    specific = shared - _GENERIC_CLAIM_FEATURES
+    overlap = len(shared) / max(1, min(len(left_features), len(right_features)))
+
+    if len(specific) >= 3 and (overlap >= 0.35 or sequence >= 0.60):
+        # 改写但保留同一串具体名词/动作（如“B站分享卡片 / 自动配图插件”）。
+        return max(sequence, 0.80)
+    if len(specific) < 3:
+        # 只共用泛词时宁可放过，别把“喜欢猫/喜欢狗”合成一条。
+        return min(sequence, 0.65)
+    if len(shared) >= 3 and overlap >= 0.55:
+        return max(sequence, overlap)
+    return sequence
+
+
+CLAIM_SIMILARITY = 0.80
+
+
 def _new_id() -> str:
     return "fact-{}-{:04d}".format(
         datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S"),
@@ -447,6 +617,7 @@ def summarize(fact: dict) -> dict:
         "updated_at": str(current.get("extracted_at", "")),
         "sources": len(current.get("source_fp") or []),
         "model": str(current.get("model", "")),
+        "prompt_version": str(current.get("prompt_version", "")),
     }
 
 
@@ -476,6 +647,7 @@ def detail(store, fact_id: str, resolve=None, max_chars: int = 2000) -> dict | N
             "kind": normalize_kind(ver.get("kind")),
             "extracted_at": str(ver.get("extracted_at", "")),
             "model": str(ver.get("model", "")),
+            "prompt_version": str(ver.get("prompt_version", "")),
             "source_fp": list(ver.get("source_fp") or []),
         })
 
@@ -516,6 +688,9 @@ def visible_facts(facts: list[dict], session: str,
                   subjects=None, source_session=None) -> list[dict]:
     """
     这个会话能看见哪些事实。
+
+    0.9.17 起事实按 id 分文件夹，主路径不再调用本函数（一个 id 里的都可见）；
+    保留它是为了以后接群聊时恢复"按人/按群"的过滤。
 
     subjects：本会话出现过的人（发送者 ID）。
     source_session：指纹 → 会话，用来判断"这条事实是哪个会话里说的"。

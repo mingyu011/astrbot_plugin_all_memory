@@ -14,6 +14,7 @@ import os
 import io
 import time
 import json
+import sqlite3
 import base64
 import zipfile
 import asyncio
@@ -25,16 +26,24 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 
 from .core import budget, extract, importer, index as index_mod, inject, refine, restore as restore_mod, sync, vault as vault_mod
+from .core import manifest as manifest_mod
+from .core import retrieve_pipeline as retrieve_mod
+from .core.entities import EntityStore
+from .core.ids import SessionIds
+from .core.synonyms import SynonymStore
 from .core import backup as backup_mod
 from .core import media as media_mod, pending as pending_mod, settings as settings_mod
 from .core import summary as summary_mod
 from .core import query as query_mod
 from .core import search as search_mod
 from .core import vectors as vectors_mod
-from .core.tokens import Calibrator, estimate_tokens
+from .core.tokens import Calibrator, estimate_tokens, usage_input_tokens
 from .web_api import WebApi
 
 TZ = timezone(timedelta(hours=8))
+
+# 全局接管状态单独存一份（不是某个会话的），开了就所有会话都生效
+GLOBAL_TAKEOVER = "__global__"
 
 DEFAULTS = {
     "data_dir": "",
@@ -45,12 +54,14 @@ DEFAULTS = {
     "total_ratio": 0.40,
     "map_ratio": 0.03,
     "recall_ratio": 0.05,
-    "summary_ratio": 0.03,
+    "summary_ratio": 0.05,
     "summary_max_chars": 0,
     "summary_keep_recent": 20,
     "facts_before_trigger": False,
     "map_days": 365,
     "recall_limit": 50,
+    "recall_context_span": 1,
+    "recall_context_hits": 3,
     "recall_snippet_chars": 800,
     "recall_expand": False,
     "auto_recall": True,
@@ -84,26 +95,25 @@ class AllMemory(Star):
 
         self.vault = vault_mod.Vault(self.root)
         self.index = index_mod.Index(self.root)
-        self.facts = extract.FactStore(self.root)
-        self.summaries = summary_mod.SummaryStore(self.root)
+        self.ids = SessionIds(self.root)
         # 检索：字面（index）+ 向量（vectors）两路，由 search.combine 融合
         self.embedder = vectors_mod.LocalEmbedder()
         self.vectors = vectors_mod.VectorStore(self.root, self.embedder.name)
-        self.query_cache = query_mod.QueryCache(self.root)
         # 向量不是"配置项"，是自动补的：启动后补历史，每轮结束补增量
-        self._vector_started = False
+        self._vector_started: set[str] = set()
         # 附件同理：库里一张图都没有时，自动从宿主库回填一次
-        self._media_backfill_started = False
+        self._media_backfill_started: set[str] = set()
         self.states = budget.StateStore(self.root)
         self.settings = settings_mod.Settings(self.root)
-        self.media = media_mod.MediaStore(self.root)
-        # 归档失败的重试队列（failed/）
-        self.failed = pending_mod.FailedQueue(self.root)
 
         self._turn_counter: dict[str, int] = {}
         self._extract_cooldown: dict[str, float] = {}
         self._last_raw_estimate: dict[str, int] = {}
         self._refining: dict[str, bool] = {}
+        # 宿主 DB 的 token_usage 读得很频繁，缓存几秒，避免每轮都开 SQLite
+        self._token_usage_cache: dict[str, tuple[float, int]] = {}
+        self._token_logged: set[str] = set()
+        self._token_debugged: set[str] = set()
         # 正在滚动纪要的会话（和提炼分开：两件事可以并行）
         self._summarizing: dict[str, bool] = {}
         # 本轮的人格快照，等 on_agent_done 归档这一轮时一起带上
@@ -129,8 +139,8 @@ class AllMemory(Star):
 
         logger.info(f"[all_memory] 总库 {self.root}｜"
                     f"事件 {self.index.count()} 条｜"
-                    f"事实 {len(self.facts.all_facts())} 条｜"
-                    f"附件 {self.media.stats()['files']} 个")
+                    f"事实 {self._all_facts_count()} 条｜"
+                    f"附件 {media_mod.stats_of(self.root)['files']} 个")
 
     # ------------------------------------------------------------ 配置
 
@@ -236,6 +246,95 @@ class AllMemory(Star):
         except (TypeError, ValueError):
             return 0
 
+    def _plugin_version(self) -> str:
+        """读 metadata.yaml 的 version，不引 YAML 依赖。"""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "metadata.yaml")
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                for line in handle:
+                    key, _, value = line.partition(":")
+                    if key.strip() == "version":
+                        return value.strip().strip("'\"") or "unknown"
+        except OSError:
+            pass
+        return "unknown"
+
+    def _manifest_meta(self) -> dict:
+        """manifest 里记的模型/提示词版本；只记知道的，不猜。"""
+        return {
+            "models": {
+                "chat": "current",
+                "extract": self._extract_model_name(),
+                "embedding": self.embedder.name,
+            },
+            "prompt_versions": {
+                "extract": refine.PROMPT_VERSION,
+                "summary": summary_mod.PROMPT_VERSION,
+            },
+        }
+
+    def _extract_model_name(self) -> str:
+        """提炼实际用的模型名（用于 facts provenance），不假装用了 extract_model。"""
+        try:
+            provider = self.context.get_using_provider()
+            model = provider.get_model() if provider is not None else ""
+            return str(model or "current")
+        except Exception:
+            return "current"
+
+    # ------------------------------------------------------------ 按 id 取存储
+
+    def facts_for(self, uid: str):
+        return extract.FactStore(self.root, uid)
+
+    def entities_for(self, uid: str):
+        return EntityStore(self.root, uid)
+
+    def synonyms_for(self, uid: str):
+        return SynonymStore(self.root, uid)
+
+    def summaries_for(self, uid: str):
+        return summary_mod.SummaryStore(self.root, uid)
+
+    def media_for(self, uid: str):
+        return media_mod.MediaStore(self.root, uid)
+
+    def failed_for(self, uid: str):
+        return pending_mod.FailedQueue(self.root, uid)
+
+    def query_cache_for(self, uid: str):
+        return query_mod.QueryCache(self.root, uid)
+
+    def media_stats(self) -> dict:
+        return media_mod.stats_of(self.root)
+
+    def _uid(self, event) -> str:
+        return self.ids.resolve(
+            self._session_of(event), self._sender_of(event),
+            self._sender_name_of(event))
+
+    def _all_facts_count(self) -> int:
+        total = 0
+        for uid in self.vault.ids():
+            try:
+                total += len(self.facts_for(uid).all_facts())
+            except Exception:
+                continue
+        return total
+
+    def _all_summaries_stats(self) -> dict:
+        sessions = 0
+        chars = 0
+        for uid in self.vault.ids():
+            try:
+                stats = self.summaries_for(uid).stats()
+            except Exception:
+                continue
+            sessions += int(stats.get("sessions") or 0)
+            chars += int(stats.get("chars") or 0)
+        return {"sessions": sessions, "chars": chars}
+
     # ------------------------------------------------------------ 主钩子
 
     @filter.on_llm_request()
@@ -253,22 +352,26 @@ class AllMemory(Star):
         if not self._cfg("enabled"):
             return
 
-        # 第一次进来时把历史向量补齐（后台跑，不阻塞本轮）
-        self._ensure_vector_backfill()
-        self._ensure_media_backfill()
-
         session = self._session_of(event)
+        if not self.ids.is_private(session):
+            return
+        uid = self._uid(event)
+
+        # 第一次进来时把该 id 的历史向量补齐（后台跑，不阻塞本轮）
+        self._ensure_vector_backfill(uid)
+        self._ensure_media_backfill(uid)
+
         try:
             raw, parsed = sync.parse_contexts(req)
             system_prompt = sync.system_of(req)
             persona = self.vault.put_persona(system_prompt)
 
             # 0) 先把上次没写进去的补上（补写发生在新增之前，顺序不会乱）
-            self._flush_failed()
+            self._flush_failed(uid)
 
             # 记住人格和「历史到哪为止」，等这一轮跑完在 on_agent_done 里
             # 只把这一轮的消息补进去（历史已经在库里了，不能整段重写）
-            self._pending_turn[session] = {
+            self._pending_turn[uid] = {
                 "persona": persona or "",
                 "context_count": len(req.contexts) if isinstance(req.contexts, list) else 0,
                 "last_fp": (vault_mod.fp_of(f"{parsed[-1]['role']}\x00{parsed[-1]['content']}")
@@ -276,16 +379,28 @@ class AllMemory(Star):
             }
 
             # 1) 归档：先把看到的一切存下来，再谈裁剪
-            state = self.states.load(session)
+            state = self.states.load(uid)
             stats = sync.sync(
                 self.vault, self.index, parsed, persona,
                 session=session, ts_hint=self._message_time(event),
-                carry=_parse_stamp(state.get("last_carry")))
+                carry=_parse_stamp(state.get("last_carry")), uid=uid)
             if stats.get("new"):
                 logger.info(f"[all_memory] 新增 {stats['new']} 条记忆 "
-                            f"(去重 {stats.get('duplicate', 0)})")
+                            f"(id {uid}，去重 {stats.get('duplicate', 0)})")
             if stats.get("carry"):
                 state["last_carry"] = stats["carry"]
+
+            # 全局接管：关 = 所有会话都不裁不注入；开 = 所有会话都注入。
+            # 默认「自动」= 还没开，任意会话第一次裁剪时自动开（对所有会话生效）。
+            global_mode = budget.takeover_mode(self.states.load(GLOBAL_TAKEOVER))
+
+            # 全局关闭接管：所有会话都不裁剪、不注入，交回 AstrBot 原生上下文。
+            # 只把「已经发生过的对话」照常归档，保证原文一条不少。
+            if global_mode == "off":
+                self.states.save(uid, state)
+                self._last_raw_estimate.pop(uid, None)
+                self._maybe_extract(event, uid)
+                return
 
             # 附件不在这一层抓：这里的 parsed 是历史，本轮消息还没进来。
             # 真正的归档在 on_agent_done（拿到本轮用户消息的指纹之后）。
@@ -293,21 +408,47 @@ class AllMemory(Star):
             calibrator = Calibrator.from_dict(state.get("calibration"))
             calibrator.enabled = bool(self._cfg("calibrate_tokens"))
 
-            system_tokens = estimate_tokens(system_prompt)
-            self._last_raw_estimate[session] = (
-                sum(estimate_tokens(m["content"]) for m in parsed) + system_tokens
-            )
-
+            # AstrBot 的工具定义在 req.func_tool 里，不在 system_prompt。
+            # 不数它，真实 95k 的请求会被算成 48k。
+            tool_tokens = _tool_schema_tokens(req)
+            system_tokens = estimate_tokens(system_prompt) + tool_tokens
+            history_raw = sum(estimate_tokens(m["content"]) for m in parsed)
             window = self._window()
+
+            # 上一轮的 conversation.token_usage 是宿主给的真实总量；
+            # 再用 on_llm_response 存下来的 last_prompt_tokens 更准（不含输出）。
+            previous_prompt = int(state.get("last_prompt_tokens", 0) or 0)
+            actual_prompt = (previous_prompt
+                             or self._db_token_usage(session)
+                             or _conversation_tokens(req))
+            previous_raw = self._last_raw_estimate.get(uid, 0)
+            if actual_prompt and previous_raw:
+                calibrator.learn(previous_raw, actual_prompt)
+                state["calibration"] = calibrator.to_dict()
+
+            # 80% 压力优先用宿主真实注入量；没有才退回校准后的字符估算。
+            trusted_tokens = actual_prompt if actual_prompt > 0 else 0
+            if trusted_tokens and window > 0 and uid not in self._token_logged:
+                self._token_logged.add(uid)
+                logger.info(
+                    f"[all_memory] 真实注入 {trusted_tokens} tok"
+                    f"（{trusted_tokens / window * 100:.1f}%），80% 按它算")
+            self._last_raw_estimate[uid] = history_raw + system_tokens
+
             if window <= 0:
                 # 没有可信窗口就不接管上下文，只归档
-                self._maybe_extract(event, session)
+                self._maybe_extract(event, uid)
                 return
 
             # 2) 预算决策（滞回）
             #    facts 固定占窗口 10%（facts_ratio_for 直接返回上限，不随裁剪次数爬坡）；
             #    早期库小、抽不满这个额度，历史自然还能多留一些
             trim_count = int(state.get("trim_count", 0) or 0)
+            # 全局接管刚打开时，会话可能还没裁过；先按「第 1 次」给 facts 预算，
+            # 否则 facts_ratio 会是 0，人物卡一块都进不去。
+            if global_mode == "on" and trim_count <= 0:
+                trim_count = 1
+                state["trim_count"] = 1
             projected = trim_count + 1
             plan = budget.decide(
                 parsed, system_tokens, window, calibrator,
@@ -317,6 +458,7 @@ class AllMemory(Star):
                 map_ratio=float(self._cfg("map_ratio")),
                 recall_ratio=float(self._cfg("recall_ratio")),
                 summary_ratio=float(self._cfg("summary_ratio")),
+                trusted_tokens=trusted_tokens,
             )
             if plan.applied:
                 trim_count = projected
@@ -326,34 +468,33 @@ class AllMemory(Star):
             # 裁剪那一刻触发两件后台活：提炼人物卡、滚动前情纪要。
             # 都扔到后台，本轮回复不等它们。
             if plan.applied and not self._cfg("dry_run"):
-                self._schedule_refine(session, budget.block_budget(
+                self._schedule_refine(uid, budget.block_budget(
                     window, facts_ratio,
                     getattr(calibrator, "ratio", 1.0) or 1.0))
-                boundary = self._first_kept_fp(plan)
-                # 记住这次裁到哪：手动生成纪要时要用同一个边界，
-                # 否则会去纪要"还在上下文里"的对话，白白重复一遍。
-                if boundary:
-                    state["summary_boundary_fp"] = boundary
-                self._schedule_summary(session, boundary)
+                self._schedule_summary(uid)
+                # 默认「自动」：任意会话第一次真裁剪，就把全局接管打开，
+                # 之后所有会话（包括新开的）都开始注入记忆。
+                if global_mode == "auto":
+                    self.auto_enable_global_takeover()
 
             # 演练模式：只记账、只写日志，绝不改动本轮请求
             if self._cfg("dry_run"):
                 if plan.applied:
                     logger.info(f"[all_memory] DRY-RUN {plan.summary()} → 未改动任何内容")
-                self._maybe_extract(event, session)
+                self._maybe_extract(event, uid)
                 return
 
             # 3) 触发裁剪，回写原始对象（保住宿主消息格式）
             #    trimmed_mode：只要裁剪过一次，此后每轮都处于「接管模式」，
             #    持续注入事实/地图/检索。否则裁完回到 40% 压力，
             #    后续几十轮 applied=False，被裁掉的内容会有一段很长的失忆期。
-            trimmed_mode = bool(state.get("trimmed_mode"))
+            trimmed_mode = bool(state.get("trimmed_mode")) or global_mode == "on"
             if plan.applied:
                 keep_ids = {m["idx"] for m in plan.kept}
                 req.contexts = [item for i, item in enumerate(raw) if i in keep_ids]
                 trimmed_mode = True
                 # 裁剪后真正发出去的历史短了，边界要跟着改
-                pending = self._pending_turn.get(session)
+                pending = self._pending_turn.get(uid)
                 if isinstance(pending, dict):
                     pending["context_count"] = len(req.contexts)
                 logger.info(f"[all_memory] {plan.summary()}")
@@ -361,10 +502,11 @@ class AllMemory(Star):
             # 4) 组装记忆块
             #    第一次裁剪之前与原版完全一致：不裁剪、不注入任何块。
             blocks: list[str] = []
+            history_raw = sum(estimate_tokens(m["content"])
+                              for m in (plan.kept if plan.applied else parsed))
             sizes = {
-                "system": system_tokens,
-                "history": sum(estimate_tokens(m["content"])
-                               for m in (plan.kept if plan.applied else parsed)),
+                "system": calibrator.apply(system_tokens),
+                "history": calibrator.apply(history_raw),
                 "summary": 0,
                 "facts": 0,
                 "map": 0,
@@ -375,12 +517,13 @@ class AllMemory(Star):
             # 只在接管模式下注入——触发裁剪之前，一块都不加。
             if trimmed_mode:
                 summary_block = inject.build_summary_block(
-                    str(self.summaries.load(session).get("text") or ""),
+                    str(self.summaries_for(uid).load().get("text") or ""),
                     self._block_budget(
                         window, float(self._cfg("summary_ratio")), calibrator))
                 if summary_block:
                     blocks.append(summary_block)
-                    sizes["summary"] = estimate_tokens(summary_block)
+                    sizes["summary"] = calibrator.apply(
+                        estimate_tokens(summary_block))
 
             # 本轮用户刚说的话：它不在 parsed 里（contexts 只有历史），
             # 得从 req.prompt 拿；拿不到才退回最后一条上下文。
@@ -388,19 +531,29 @@ class AllMemory(Star):
                 or (parsed[-1]["content"] if parsed else "")
 
             if trimmed_mode or self._cfg("facts_before_trigger"):
+                facts_budget = self._block_budget(
+                    window, facts_ratio, calibrator)
                 facts_block = inject.build_facts_block(
-                    self._active_facts(session, query_text),
-                    self._block_budget(window, facts_ratio, calibrator))
+                    self._active_facts(uid, query_text,
+                                       budget=facts_budget),
+                    facts_budget)
                 if facts_block:
                     blocks.append(facts_block)
-                    sizes["facts"] = estimate_tokens(facts_block)
+                    sizes["facts"] = calibrator.apply(
+                        estimate_tokens(facts_block))
 
             if trimmed_mode:
+                recall_trace = {
+                    "at": _now_iso(), "query": query_text[:200],
+                    "candidates": 0, "known": 0, "after_known": 0,
+                    "expanded": 0, "final": 0, "chars": 0,
+                    "fps": [],
+                }
                 if self._cfg("auto_recall"):
                     limit = max(1, int(self._cfg("recall_limit")))
                     # 两路召回（字面 + 向量），多取一些：下面要剔掉已在本轮上下文里的
                     hits = await self.retrieve(
-                        query_text, session=session, limit=limit * 2,
+                        query_text, uid=uid, limit=limit * 2,
                         use_llm=bool(self._cfg("recall_expand")))
 
                     # 最近 N 轮已经原样发出去了，检索再把它们捞回来纯属浪费，
@@ -408,30 +561,39 @@ class AllMemory(Star):
                     in_context = plan.kept if plan.applied else parsed
                     skip = {vault_mod.fp_of(f"{m['role']}\x00{m['content']}")
                             for m in in_context}
-                    # 问"第一次/最早"时，把最早那天的原话直接排前面：
-                    # 这类问题检索词未必命中（"第一次见面"不一定出现在原句里），
-                    # 交给模型自觉去查不如直接把证据递到眼前。
-                    if query_mod.is_earliest_intent(query_text):
-                        hits = self._earliest_hits(hits)
-                    # 指名道姓问了某一天（昨天 / 10月20 / 2026-10-22），
-                    # 就把那天的原话也直接递上去——问"那天吃了什么"时，
-                    # 原文很可能只写"对付了两口"，单靠检索词命不中。
-                    start_day, end_day = query_mod.time_window(query_text)
-                    if start_day and start_day == end_day:
-                        hits = self._day_hits(hits, start_day)
+                    # earliest / 按天 / 负向 / 前后文已经在 retrieve_pipeline 里做完，
+                    # 这里只做“剔除本轮上下文”和计数。
+                    recall_trace["candidates"] = len(hits)
+                    before_known = len(hits)
                     hits = inject.drop_known(hits, skip)[:limit]
+                    recall_trace["known"] = before_known - len(hits)
+                    recall_trace["after_known"] = len(hits)
+                    recall_trace["expanded"] = sum(
+                        1 for hit in hits if hit.get("is_context"))
+                    hits = inject.drop_known(hits, skip)
+                    recall_trace["final"] = len(hits)
+                    recall_trace["fps"] = [str(h.get("fp") or "")
+                                           for h in hits[:10]]
 
                     recall_block = inject.build_recall_block(
                         hits,
                         self._block_budget(
                             window, float(self._cfg("recall_ratio")), calibrator),
                         max_chars=int(self._cfg("recall_snippet_chars") or 800))
+                    recall_trace["chars"] = len(recall_block or "")
                     if recall_block:
                         blocks.append(recall_block)
-                        sizes["recall"] = estimate_tokens(recall_block)
+                        sizes["recall"] = calibrator.apply(
+                            estimate_tokens(recall_block))
+                    logger.info(
+                        f"[all_memory] 检索：候选 {recall_trace['candidates']} / "
+                        f"已在本轮上下文 {recall_trace['known']} / "
+                        f"扩上下文 +{recall_trace['expanded']} / "
+                        f"最终 {recall_trace['final']}（{recall_trace['chars']} 字）")
+                state["last_recall"] = recall_trace
 
-                # 地图覆盖全部历史，不是只回看 N 天
-                day_rows = self.index.day_summary(days=None)
+                # 地图覆盖全部历史，不是只回看 N 天；只算当前 id
+                day_rows = self.index.day_summary(days=None, uid=uid)
                 map_block = inject.build_map_block(
                     day_rows,
                     self._block_budget(
@@ -439,7 +601,7 @@ class AllMemory(Star):
                     detail_days=int(self._cfg("map_days")))
                 if map_block:
                     blocks.append(map_block)
-                    sizes["map"] = estimate_tokens(map_block)
+                    sizes["map"] = calibrator.apply(estimate_tokens(map_block))
 
             payload = inject.compose(blocks)
             if payload and not inject.attach(req, payload):
@@ -449,9 +611,19 @@ class AllMemory(Star):
             #    payload 本来就是 facts + 地图 + 检索拼起来的（外加使用提示和 _no_save 戳），
             #    所以合计只能 = 主体（system + history）+ payload。
             #    把那三块再加一遍会让「合计」凭空多算一次，拿它调参会被带偏。
-            sizes["payload"] = estimate_tokens(payload) if payload else 0
-            sizes["total"] = budget.total_request_tokens(
-                sizes["system"], sizes["history"], sizes["payload"])
+            sizes["payload"] = (calibrator.apply(estimate_tokens(payload))
+                                if payload else 0)
+            if trusted_tokens > 0:
+                # 合计显示宿主真实注入量，不再拿字符估算冒充。
+                sizes["total"] = trusted_tokens
+                # 真实总量里，除了历史/注入块，剩下的主要就是工具定义。
+                # 面板没有单独的「工具」格，就并进「人格/工具」，别让它凭空消失。
+                residual = trusted_tokens - sizes["history"] - sizes["payload"]
+                if residual > sizes["system"]:
+                    sizes["system"] = residual
+            else:
+                sizes["total"] = budget.total_request_tokens(
+                    sizes["system"], sizes["history"], sizes["payload"])
             usage = {
                 "at": _now_iso(),
                 "window": window,
@@ -478,9 +650,9 @@ class AllMemory(Star):
                 "after": plan.after,
                 "dropped": plan.dropped,
             }
-            self.states.save(session, state)
+            self.states.save(uid, state)
 
-            self._maybe_extract(event, session)
+            self._maybe_extract(event, uid)
         except Exception as exc:
             logger.warning(f"[all_memory] 请求处理失败（已跳过本轮）: {exc}")
 
@@ -499,19 +671,23 @@ class AllMemory(Star):
             return
         if not self._cfg("enabled"):
             return
-        session = self._session_of(event)
+        if not self.ids.is_private(self._session_of(event)):
+            return
+        uid = self._uid(event)
         try:
             # 用真实用量校准估算
             usage = getattr(resp, "usage", None)
             actual = _prompt_tokens(usage)
-            raw_estimate = self._last_raw_estimate.get(session, 0)
-            if actual and raw_estimate:
-                state = self.states.load(session)
-                calibrator = Calibrator.from_dict(state.get("calibration"))
-                calibrator.enabled = bool(self._cfg("calibrate_tokens"))
-                calibrator.learn(raw_estimate, actual)
-                state["calibration"] = calibrator.to_dict()
-                self.states.save(session, state)
+            raw_estimate = self._last_raw_estimate.get(uid, 0)
+            if actual:
+                state = self.states.load(uid)
+                state["last_prompt_tokens"] = int(actual)
+                if raw_estimate:
+                    calibrator = Calibrator.from_dict(state.get("calibration"))
+                    calibrator.enabled = bool(self._cfg("calibrate_tokens"))
+                    calibrator.learn(raw_estimate, actual)
+                    state["calibration"] = calibrator.to_dict()
+                self.states.save(uid, state)
         except Exception as exc:
             logger.debug(f"[all_memory] 用量校准失败: {exc}")
 
@@ -553,12 +729,16 @@ class AllMemory(Star):
                     return
 
                 session = self._session_of(event)
+                if not self.ids.is_private(session):
+                    return
+                uid = self._uid(event)
                 # 挂在最后一条助手消息上；找不到就退到本会话最后一条记录
-                msg_fp = self._last_assistant_fp.get(session) or self.index.last_fp(session)
+                msg_fp = (self._last_assistant_fp.get(uid)
+                          or self.index.last_fp(session, uid))
                 if not msg_fp:
                     return
                 task = asyncio.create_task(
-                    self.media.ingest(msg_fp, session, sources))
+                    self.media_for(uid).ingest(msg_fp, session, sources))
                 task.add_done_callback(_log_task_error)
                 logger.debug(f"[all_memory] 出站附件 {len(sources)} 个 → {msg_fp}")
             except Exception as exc:
@@ -593,7 +773,10 @@ class AllMemory(Star):
                 return
 
             session = self._session_of(event)
-            pending = self._pending_turn.pop(session, {}) or {}
+            if not self.ids.is_private(session):
+                return
+            uid = self._uid(event)
+            pending = self._pending_turn.pop(uid, {}) or {}
             persona = str(pending.get("persona") or "")
 
             # 只取这一轮（历史已经在库里了）；边界对不上就退回整段去重
@@ -615,35 +798,36 @@ class AllMemory(Star):
                 # exact=True（正常情况）：这一轮照写。同一句话以前说过也要留一条，
                 # 只把重复的编成 base-2/-3，不会因为「库里已有」就丢掉。
                 # exact=False（边界不可信）：退回按内容去重，绝不重写历史。
-                state = self.states.load(session)
+                state = self.states.load(uid)
                 stats = sync.sync(self.vault, self.index, parsed, persona,
                                   session=session, origin="astrbot_turn",
                                   force=exact,
                                   carry=_parse_stamp(state.get("last_carry")),
-                                  sender=self._sender_of(event))
+                                  sender=self._sender_of(event), uid=uid)
                 if stats.get("carry") and stats["carry"] != state.get("last_carry"):
                     state["last_carry"] = stats["carry"]
-                    self.states.save(session, state)
+                    self.states.save(uid, state)
                 if stats.get("new"):
                     logger.info(f"[all_memory] 本轮补入 {stats['new']} 条 "
-                                f"(编号 {stats.get('renamed', 0)} 条)")
+                                f"(id {uid}，编号 {stats.get('renamed', 0)} 条)")
                 # 附件：本轮用户消息的图片/语音，键就是刚才存进去的那条指纹
-                self._capture_turn_media(event, parsed, session)
+                self._capture_turn_media(event, parsed, session, uid)
                 # 记下最后一条助手消息：有些插件会在回复之后自己追加表情，
                 # 那些图不在 run_context.messages 里，只能由 decorator 钩子接住
                 for item in reversed(parsed):
                     if item.get("role") == "assistant":
-                        self._last_assistant_fp[session] = vault_mod.fp_of(
+                        self._last_assistant_fp[uid] = vault_mod.fp_of(
                             f"assistant\x00{item['content']}")
                         break
                 # 向量：纯本地计算，几十毫秒，后台补，别拖慢回复
                 try:
-                    asyncio.create_task(asyncio.to_thread(self.vectorize_recent))
+                    asyncio.create_task(
+                        asyncio.to_thread(self.vectorize_recent, 400, uid))
                 except RuntimeError:
                     pass
             except Exception as exc:
                 # 写失败不能只留一行日志：先落盘，下一轮请求进来时补写
-                path = self.failed.push(session, parsed, persona, str(exc))
+                path = self.failed_for(uid).push(session, parsed, persona, str(exc))
                 logger.warning(
                     f"[all_memory] 本轮归档失败，"
                     + (f"已存入重试队列（{os.path.basename(path)}）" if path
@@ -652,51 +836,79 @@ class AllMemory(Star):
 
     # ------------------------------------------------------------ 接管模式
 
-    def enable_takeover(self, sessions) -> int:
-        """
-        让这些会话进入「接管模式」：每轮都带记忆地图 + 相关检索（+ facts）。
+    def global_takeover_state(self) -> dict:
+        """给面板看的全局接管状态：auto / on / off。"""
+        state = self.states.load(GLOBAL_TAKEOVER)
+        mode = budget.takeover_mode(state)
+        return {
+            "mode": mode,
+            "manual": str(state.get("takeover_manual") or "") == "on",
+            "trimmed": bool(state.get("trimmed_mode")),
+            "takeover_at": str(state.get("takeover_at") or ""),
+            "window": self._window(),
+        }
 
-        恢复备份之后要开：新会话上下文才 1%，永远到不了 80% 触发线，
-        不开的话旧记忆只能靠她自己 search_memory 去查。
-        """
-        count = 0
-        for session in sessions or []:
-            if not session:
-                continue
-            state = self.states.load(session)
-            if state.get("trimmed_mode"):
-                continue
+    def set_global_takeover(self, on: bool) -> dict:
+        """全局开关：一次对所有会话生效（含以后新开的会话）。"""
+        if on and self._window() <= 0:
+            return {"ok": False,
+                    "error": "先填上下文窗口（window_tokens），否则接管不会注入"}
+        state = self.states.load(GLOBAL_TAKEOVER)
+        if on:
+            state["takeover_manual"] = "on"
             state["trimmed_mode"] = True
-            state["trim_count"] = max(1, int(state.get("trim_count", 0) or 0))
-            state["takeover_at"] = _now_iso()
-            self.states.save(session, state)
-            count += 1
-        if count:
-            logger.info(f"[all_memory] 已让 {count} 个会话进入接管模式")
-        return count
+        else:
+            state["takeover_manual"] = "off"
+            state["trimmed_mode"] = False
+        state["takeover_at"] = _now_iso()
+        self.states.save(GLOBAL_TAKEOVER, state)
+        logger.info(f"[all_memory] 全局接管{'开启' if on else '关闭'}")
+        return {"ok": True, **self.global_takeover_state()}
 
-    def disable_takeover(self, session: str) -> None:
-        state = self.states.load(session)
-        state["trimmed_mode"] = False
-        self.states.save(session, state)
+    def auto_enable_global_takeover(self) -> None:
+        """默认「自动」：任意会话第一次真裁剪时，把全局接管打开。"""
+        state = self.states.load(GLOBAL_TAKEOVER)
+        if str(state.get("takeover_manual") or "") == "off":
+            return
+        if budget.takeover_mode(state) == "on":
+            return
+        state["takeover_manual"] = ""
+        state["trimmed_mode"] = True
+        state["takeover_at"] = _now_iso()
+        self.states.save(GLOBAL_TAKEOVER, state)
+        logger.info("[all_memory] 首次裁剪：全局接管已自动开启（所有会话）")
+
+    def enable_takeover(self, sessions=None) -> int:
+        """恢复备份后用：直接开全局接管。返回值只用于提示影响面。"""
+        result = self.set_global_takeover(True)
+        if not result.get("ok"):
+            return 0
+        return len(list(sessions or [])) or 1
+
+    def disable_takeover(self) -> None:
+        self.set_global_takeover(False)
 
     @filter.command("allmem_takeover")
     async def cmd_takeover(self, event: AstrMessageEvent, mode: str = ""):
-        """手动开关接管模式：开=每轮都带记忆，关=触发前零注入。"""
+        """全局开关：开=所有会话都带记忆；关=全都不裁不注入，交回官方。"""
         try:
-            session = self._session_of(event)
             mode = (mode or "").strip().lower()
             if mode in ("off", "0", "关", "关闭"):
-                self.disable_takeover(session)
+                self.disable_takeover()
                 yield event.plain_result(
-                    "已关闭接管模式：回到「触发前零注入」，和原版一致。")
+                    "已关闭全局接管：所有会话都不再裁剪、不再注入记忆块，"
+                    "交回 AstrBot 原生上下文。\n"
+                    "已经被裁掉的历史不会自动回来；要恢复全量得从 vault 重建。\n"
+                    "重新开启：/allmem_takeover")
                 return
 
-            self.enable_takeover([session])
+            result = self.set_global_takeover(True)
+            if not result.get("ok"):
+                yield event.plain_result(result.get("error") or "开启失败")
+                return
             yield event.plain_result(
-                "已开启接管模式：\n"
-                "此后每轮都会带记忆地图 + 相关性检索（预算约 8%），"
-                "有事实的话也会带人物卡。\n"
+                "已开启全局接管：所有会话（含以后新开的）都会带记忆地图 + "
+                "相关性检索（预算约 8%），有事实的话也会带人物卡。\n"
                 "关闭：/allmem_takeover off")
         except Exception as exc:
             yield event.plain_result(f"操作失败: {exc}")
@@ -728,6 +940,32 @@ class AllMemory(Star):
         target = os.path.join(exports, name)
 
         info = backup_mod.build_zip(target, self.export_targets())
+        meta = self._manifest_meta()
+        try:
+            manifest_info = manifest_mod.attach_to_zip(
+                target, plugin_version=self._plugin_version(),
+                models=meta["models"],
+                prompt_versions=meta["prompt_versions"])
+            info["files"] = int(info.get("files", 0)) + 2
+            info["manifest"] = {
+                "schema": manifest_info.get("schema", ""),
+                "events": (manifest_info.get("counts") or {}).get("events", 0),
+                "facts": (manifest_info.get("counts") or {}).get("facts", 0),
+                "files": (manifest_info.get("counts") or {}).get("files", 0),
+            }
+        except Exception as exc:
+            logger.warning(f"[all_memory] manifest 写入导出包失败: {exc}")
+            info["manifest_error"] = str(exc)
+
+        # 让在线目录也自描述；失败不影响本次导出。
+        try:
+            manifest_mod.write(
+                self.root, plugin_version=self._plugin_version(),
+                models=meta["models"],
+                prompt_versions=meta["prompt_versions"])
+        except Exception as exc:
+            logger.warning(f"[all_memory] manifest 写入数据目录失败: {exc}")
+
         pruned = self.prune_exports()
         return {
             "name": name,
@@ -783,12 +1021,12 @@ class AllMemory(Star):
             out.append(entry)
         return out
 
-    def _write_session_rows(self, session: str, handle) -> int:
+    def _write_session_rows(self, session: str, handle, uid: str) -> int:
         """把一个会话写成 jsonl，一行一条；返回条数。"""
         data = self.index.history(session, offset=0, limit=0, newest_first=False)
         items = data.get("items") or []
         fingerprints = {str(item.get("fp") or "") for item in items}
-        media_map = self.media.records_for(fingerprints)
+        media_map = self.media_for(uid).records_for(fingerprints)
 
         for item in items:
             fingerprint = str(item.get("fp") or "")
@@ -828,10 +1066,11 @@ class AllMemory(Star):
 
         if len(chosen) == 1:
             session = chosen[0]
+            uid = self.ids.id_for(session)
             name = f"{self._session_slug(session)}_{stamp}.jsonl"
             path = os.path.join(exports, name)
             with open(path, "w", encoding="utf-8", newline="\n") as handle:
-                count = self._write_session_rows(session, handle)
+                count = self._write_session_rows(session, handle, uid)
             return {
                 "name": name,
                 "path": path,
@@ -849,7 +1088,8 @@ class AllMemory(Star):
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
             for session in chosen:
                 buffer = io.StringIO()
-                total += self._write_session_rows(session, buffer)
+                total += self._write_session_rows(
+                    session, buffer, self.ids.id_for(session))
                 archive.writestr(f"{self._session_slug(session)}.jsonl",
                                  buffer.getvalue())
         return {
@@ -966,28 +1206,29 @@ class AllMemory(Star):
 
     # ------------------------------------------------------------ 提炼
 
-    def _maybe_extract(self, event, session: str) -> None:
+    def _maybe_extract(self, event, uid: str) -> None:
         """可选的周期性提炼（默认关闭，0）。主路径是裁剪时触发。"""
         interval = int(self._cfg("auto_extract_interval") or 0)
         if interval <= 0:
             return
-        count = self._turn_counter.get(session, 0) + 1
-        self._turn_counter[session] = count
+        count = self._turn_counter.get(uid, 0) + 1
+        self._turn_counter[uid] = count
         if count % interval != 0:
             return
-        if self._extract_cooldown.get(session, 0) > asyncio.get_event_loop().time():
+        if self._extract_cooldown.get(uid, 0) > asyncio.get_event_loop().time():
             return
         try:
-            asyncio.create_task(self._refine_job(session, reason="periodic"))
+            asyncio.create_task(self._refine_job(uid, reason="periodic"))
         except RuntimeError:
             pass
 
-    def start_refine(self, session: str = "__web__", reason: str = "web") -> dict:
+    def start_refine(self, uid: str = "__web__", reason: str = "web",
+                     replace: bool = True) -> dict:
         """
-        启动一次全量提炼（指令与面板共用这一个入口）。
+        启动一次提炼（指令与面板共用这一个入口）。
 
-        **全局只允许一个在跑**：提炼最后是 replace_all（旧目录归档 → staging 换上去），
-        两路同时跑会互相覆盖，所以这里查的是所有会话，不只是自己那个。
+        手动触发 / 切片长度变化 → replace=True（全量重炼，旧版归档）。
+        自动裁剪 → replace=False（只处理游标之后的新历史，追加）。
         """
         if any(bool(flag) for flag in self._refining.values()):
             return {"ok": False, "error": "已经有一轮提炼在跑，等它结束"}
@@ -996,13 +1237,14 @@ class AllMemory(Star):
         if window <= 0:
             return {"ok": False, "error": "还没填 window_tokens，算不出 facts 预算"}
 
-        state = self.states.load(session)
+        state = self.states.load(uid)
         ratio = budget.facts_ratio_for(int(state.get("trim_count", 0) or 0))
         facts_budget = budget.block_budget(window, ratio, 1.0)
 
         try:
             task = asyncio.create_task(self._refine_job(
-                session, facts_budget=facts_budget, reason=reason))
+                uid, facts_budget=facts_budget, reason=reason,
+                replace=replace))
             task.add_done_callback(_log_task_error)
         except RuntimeError:
             return {"ok": False, "error": "当前没有可用的后台任务循环"}
@@ -1012,59 +1254,62 @@ class AllMemory(Star):
             "window": window,
             "facts_budget": facts_budget,
             "facts_ratio": round(ratio * 100, 2),
-            "message": f"已开始全量提炼：预算约 {facts_budget} tok"
-                       f"（{ratio * 100:.0f}%），旧人物卡会先归档",
+            "replace": bool(replace),
+            "message": (f"已开始全量提炼：预算约 {facts_budget} tok"
+                        f"（{ratio * 100:.0f}%），旧人物卡会先归档"
+                        if replace else
+                        f"已开始增量提炼：预算约 {facts_budget} tok"),
         }
 
-    def _schedule_refine(self, session: str, facts_budget: int) -> None:
+    def _schedule_refine(self, uid: str, facts_budget: int) -> None:
         """
-        裁剪那一刻触发提炼：扫全量库，输出受 facts 预算约束。
-
-        这是主路径。放在后台任务里跑，不阻塞这一轮回复。
+        裁剪那一刻触发提炼：只处理该 id 游标之后的新历史，追加。
         """
         if not self._cfg("extract_on_trim"):
             return
-        if self._refining.get(session):
+        if self._refining.get(uid):
             logger.info("[all_memory] 上一轮提炼还没跑完，本次跳过")
             return
         try:
             task = asyncio.create_task(
-                self._refine_job(session, facts_budget=facts_budget,
-                                 reason="trim"))
+                self._refine_job(uid, facts_budget=facts_budget,
+                                 reason="trim", replace=False))
             task.add_done_callback(_log_task_error)
         except RuntimeError:
             pass
 
-    async def _refine_job(self, session: str, facts_budget: int = 0,
-                          reason: str = "trim") -> None:
-        if self._refining.get(session):
+    async def _refine_job(self, uid: str, facts_budget: int = 0,
+                          reason: str = "trim", replace: bool = False) -> None:
+        if self._refining.get(uid):
             return
-        self._refining[session] = True
+        self._refining[uid] = True
         try:
             window = self._window()
             if facts_budget <= 0 and window > 0:
-                state = self.states.load(session)
+                state = self.states.load(uid)
                 facts_budget = budget.block_budget(
                     window, budget.facts_ratio_for(
                         int(state.get("trim_count", 0) or 0)), 1.0)
 
-            # 读全量库是 IO，扔线程里，别卡事件循环。
-            # 同时把工具输出滤掉：它们是噪声（"File written successfully"），
-            # 既拖慢提炼，又稀释 prompt 里的有效信息。
-            events = await asyncio.to_thread(self._extract_events)
+            # 读该 id 的原文是 IO，扔线程里，别卡事件循环。
+            events = await asyncio.to_thread(self._extract_events, uid)
             if len(events) < 4:
                 return
 
             chunk_chars = int(self._cfg("extract_chunk_chars") or 6000)
-            # 每批最多出几条事实：facts 预算（窗口 10%）÷ 每批字数。
-            # 窗口越大、预算越大，单批能存的条数就越多，不需要别的上限。
+            state = self.states.load(uid)
+            previous_chunk = int(state.get("facts_chunk_chars", 0) or 0)
+            if previous_chunk and previous_chunk != chunk_chars:
+                replace = True
+                logger.info("[all_memory] 切片长度变了：该 id 事实全量重做")
+            cursor = str(state.get("facts_covered_fp") or "")
+            cursor_index = int(state.get("facts_covered_index", 0) or 0)
+
             per_batch = max(1, int(max(200, facts_budget) / max(1, chunk_chars)))
             concurrency = max(1, int(self._cfg("extract_concurrency") or 6))
-
             total_chars = sum(len(str(e.get("text", ""))) for e in events)
-            model_name = str(self._cfg("extract_model") or "")
+            model_name = self._extract_model_name()
 
-            state = self.states.load(session)
             previous = state.get("last_refine") or {}
             estimate = ""
             if previous.get("batches") and previous.get("seconds"):
@@ -1073,35 +1318,41 @@ class AllMemory(Star):
                             / concurrency)
                 estimate = f"，预计约 {rough} 秒"
             logger.info(
-                f"[all_memory] 开始提炼（{reason}）：{len(events)} 条 / "
-                f"{total_chars} 字，按 {chunk_chars} 字切批，"
+                f"[all_memory] 开始提炼（{reason}/{ '全量' if replace else '增量' }）："
+                f"{len(events)} 条 / {total_chars} 字，按 {chunk_chars} 字切批，"
                 f"每批最多 {per_batch} 条，并发 {concurrency}{estimate}")
 
             started = time.monotonic()
             result = await refine.run(
-                self._call_llm, events, self.facts,
+                self._call_llm, events, self.facts_for(uid),
                 target_tokens=max(200, facts_budget),
                 model=model_name,
                 chunk_chars=chunk_chars,
                 max_facts=per_batch,
-                cache=refine.ExtractionCache(self.root),
+                replace=replace,
+                cursor=("" if replace else cursor),
+                cursor_index=(0 if replace else cursor_index),
+                cache=refine.ExtractionCache(self.root, uid),
                 concurrency=concurrency,
             )
             elapsed = time.monotonic() - started
             logger.info(
-                f"[all_memory] 提炼完成：{result.get('batches')} 批"
+                f"[all_memory] 提炼完成（{result.get('mode')}）："
+                f"{result.get('batches')} 批"
                 f"（复用 {result.get('cached_batches', 0)} 批）→ "
                 f"{result.get('written')} 条事实，"
                 f"{result.get('tokens')} tok / 预算 {result.get('target_tokens')}，"
                 f"用时 {elapsed:.0f} 秒"
-                + ("（超出一部分，注入时按权重截）"
+                + ("（超出一部分，注入时取最近）"
                    if result.get("over_budget") else ""))
 
-            state = self.states.load(session)
+            state = self.states.load(uid)
             state["last_refine"] = {
                 "at": _now_iso(),
                 "reason": reason,
+                "mode": result.get("mode"),
                 "events": len(events),
+                "events_used": result.get("events_used", 0),
                 "chars": total_chars,
                 "chunk_chars": chunk_chars,
                 "concurrency": concurrency,
@@ -1115,13 +1366,19 @@ class AllMemory(Star):
                 "failed_batches": result.get("failed_batches"),
                 "seconds": round(elapsed, 1),
             }
-            self.states.save(session, state)
+            if not result.get("error"):
+                state["facts_chunk_chars"] = chunk_chars
+                if result.get("covered_fp"):
+                    state["facts_covered_fp"] = result["covered_fp"]
+                if result.get("covered_index"):
+                    state["facts_covered_index"] = int(result["covered_index"])
+            self.states.save(uid, state)
         except Exception as exc:
             logger.warning(f"[all_memory] 提炼失败（已跳过）: {exc}")
-            self._extract_cooldown[session] = (
+            self._extract_cooldown[uid] = (
                 asyncio.get_event_loop().time() + 300)
         finally:
-            self._refining[session] = False
+            self._refining[uid] = False
 
     # ------------------------------------------------------------ 前情纪要
 
@@ -1134,104 +1391,64 @@ class AllMemory(Star):
         first = kept[0]
         return vault_mod.fp_of(f"{first['role']}\x00{first['content']}")
 
-    def start_summary(self, session: str, boundary_fp: str = "",
-                      reason: str = "manual") -> dict:
+    def start_summary(self, uid: str, reason: str = "manual") -> dict:
         """
         启动一次滚动纪要（指令与面板共用）。
 
-        边界优先级：
-          1. 调用方给的（裁剪那一刻算出来的）
-          2. state 里记的"上次裁到哪"——手动生成时要和自动那次用同一个边界，
-             否则会去纪要还留在上下文里的对话
-          3. 都没有（还没裁剪过）→ 退回「最近 N 条之前」，纯粹是给个能看的演示
+        只追加：从上次纪要覆盖到的那条之后，处理到该 id 当前最后一条。
         """
-        if self._summarizing.get(session):
-            return {"ok": False, "error": "这个会话正在生成纪要，等它结束"}
-
-        if not boundary_fp:
-            boundary_fp = str(
-                self.states.load(session).get("summary_boundary_fp") or "")
+        if self._summarizing.get(uid):
+            return {"ok": False, "error": "这个 id 正在生成纪要，等它结束"}
 
         try:
             task = asyncio.create_task(
-                self._summary_job(session, boundary_fp=boundary_fp, reason=reason))
+                self._summary_job(uid, reason=reason))
             task.add_done_callback(_log_task_error)
         except RuntimeError:
             return {"ok": False, "error": "当前没有可用的后台任务循环"}
 
         return {
             "ok": True,
-            "session": session,
+            "id": uid,
             "reason": reason,
-            "boundary": "trim" if boundary_fp else "fallback",
-            "message": ("已开始生成前情纪要：覆盖到上次裁剪保留的第一条之前"
-                        if boundary_fp else
-                        "已开始生成前情纪要：还没裁剪过，先按最近 20 条之前演示"),
+            "message": "已开始生成前情纪要：只追加还没纪要过的历史",
         }
 
-    def _schedule_summary(self, session: str, boundary_fp: str) -> None:
+    def _schedule_summary(self, uid: str) -> None:
         """裁剪那一刻触发。配了 0 预算就不生成，省得白调模型。"""
         try:
             if float(self._cfg("summary_ratio") or 0) <= 0:
                 return
         except (TypeError, ValueError):
             return
-        if self._summarizing.get(session):
+        if self._summarizing.get(uid):
             logger.info("[all_memory] 上一轮纪要还没跑完，本次跳过")
             return
         try:
             task = asyncio.create_task(
-                self._summary_job(session, boundary_fp, "trim"))
+                self._summary_job(uid, "trim"))
             task.add_done_callback(_log_task_error)
         except RuntimeError:
             pass
 
-    def _summary_max_chars(self, event_count: int = 0) -> int:
-        """
-        纪要的字数上限。
-
-        显式配了 `summary_max_chars` 就用它；配 0 表示"按预算自动算"：
-        纪要占窗口的 3%，100 万窗口对应约 3 万 token ≈ 5 万汉字，
-        真长到那个量级每轮都要重写一遍、也读不完，所以自动封在 8000 字，
-        再小不低于 2000——太短会把早期经历挤没。
-        """
-        configured = int(self._cfg("summary_max_chars") or 0)
-        if configured > 0:
-            return configured
-        window = self._window()
-        if window <= 0:
-            return 2000
-        try:
-            ratio = float(self._cfg("summary_ratio") or 0.03)
-        except (TypeError, ValueError):
-            ratio = 0.03
-        budget_chars = int(window * ratio * 1.6)
-        return max(2000, min(8000, budget_chars))
-
-    async def _summary_job(self, session: str, boundary_fp: str = "",
-                           reason: str = "trim") -> None:
-        if self._summarizing.get(session):
+    async def _summary_job(self, uid: str, reason: str = "trim") -> None:
+        if self._summarizing.get(uid):
             return
-        self._summarizing[session] = True
+        self._summarizing[uid] = True
         try:
-            events = await asyncio.to_thread(self._session_events, session)
+            events = await asyncio.to_thread(self._session_events, uid)
             if len(events) < 4:
                 logger.info("[all_memory] 内容太少，跳过纪要")
                 return
 
             chunk_chars = int(self._cfg("extract_chunk_chars") or 6000)
-            max_chars = self._summary_max_chars(len(events))
-            keep_recent = int(self._cfg("summary_keep_recent") or 20)
-
             logger.info(f"[all_memory] 开始生成纪要（{reason}）：{len(events)} 条，"
-                        f"边界 {boundary_fp[:8] or f'最近 {keep_recent} 条之前'}")
+                        f"id {uid}")
 
             result = await summary_mod.build(
-                self._call_llm, events, self.summaries, session,
-                boundary_fp=boundary_fp, chunk_chars=chunk_chars,
-                max_chars=max_chars,
-                cache=summary_mod.SummaryCache(self.root),
-                keep_recent=keep_recent)
+                self._call_llm, events, self.summaries_for(uid),
+                chunk_chars=chunk_chars,
+                cache=summary_mod.SummaryCache(self.root, uid))
 
             if result.get("skipped"):
                 logger.info("[all_memory] 纪要不更新：没有新的可纪要内容")
@@ -1243,7 +1460,7 @@ class AllMemory(Star):
             else:
                 logger.warning(f"[all_memory] 纪要失败：{result.get('error')}")
 
-            state = self.states.load(session)
+            state = self.states.load(uid)
             state["last_summary"] = {
                 "at": _now_iso(),
                 "reason": reason,
@@ -1255,13 +1472,13 @@ class AllMemory(Star):
                 "covered_until": result.get("covered_until", ""),
                 "error": result.get("error", ""),
             }
-            self.states.save(session, state)
+            self.states.save(uid, state)
         except Exception as exc:
             logger.warning(f"[all_memory] 纪要失败（已跳过）: {exc}")
         finally:
-            self._summarizing[session] = False
+            self._summarizing[uid] = False
 
-    def _extract_events(self) -> list[dict]:
+    def _extract_events(self, uid: str) -> list[dict]:
         """
         提炼用的原文。
 
@@ -1274,7 +1491,7 @@ class AllMemory(Star):
         """
         skip_tool = bool(self._cfg("extract_skip_tool"))
         kept: list[dict] = []
-        for event in self.vault.iter_events():
+        for event in self.vault.iter_events(uid):
             if not str(event.get("text", "")).strip():
                 continue
             if skip_tool and str(event.get("role")) == "tool":
@@ -1297,13 +1514,9 @@ class AllMemory(Star):
             out.append({**event, "sender": guess} if guess else event)
         return out
 
-    def _session_events(self, session: str) -> list[dict]:
-        """这个会话的全部原文，按写入顺序（跨会话混起来就没法写叙事了）。"""
-        events = list(self.vault.iter_events())
-        picked = [e for e in events
-                  if str(e.get("session") or "") == (session or "")]
-        # 单会话/导入数据可能没有 session 字段，那样退回全量
-        return picked if len(picked) >= 4 else events
+    def _session_events(self, uid: str) -> list[dict]:
+        """这个 id 的全部原文，按写入顺序。"""
+        return list(self.vault.iter_events(uid))
 
     async def _call_llm(self, prompt: str) -> str:
         """尽量兼容不同 AstrBot 版本的调用方式，全都失败就返回空。"""
@@ -1346,7 +1559,8 @@ class AllMemory(Star):
 
     # ------------------------------------------------------------ 检索
 
-    async def _expand_terms(self, text: str, use_llm: bool = False) -> list[str]:
+    async def _expand_terms(self, text: str, use_llm: bool = False,
+                            uid: str = "default") -> list[str]:
         """
         让模型补几个同义词（可选）。
 
@@ -1356,7 +1570,8 @@ class AllMemory(Star):
         """
         if not use_llm:
             return []
-        cached = self.query_cache.get(text)
+        cache = self.query_cache_for(uid)
+        cached = cache.get(text)
         if cached is not None:
             return cached
         try:
@@ -1366,84 +1581,77 @@ class AllMemory(Star):
             return []
         terms = query_mod.parse_expansions(raw)
         if terms:
-            self.query_cache.put(text, terms)
+            cache.put(text, terms)
         return terms
 
-    async def retrieve(self, text: str, session: str = "", limit: int = 20,
+    async def retrieve(self, text: str, uid: str = "default", limit: int = 20,
                        use_llm: bool = False) -> list[dict]:
         """
-        字面 + 向量两路召回，融合排序。
+        字面 + 向量两路召回，融合排序；只查这个 id。
 
-        自动召回、search_memory 工具、/allmem_search 共用这一个入口——
-        三处各写一套的话，调好一处另外两处还是旧的。
+        自动召回、search_memory 工具、/allmem_search 共用这一个入口。
+        具体排序在 core/retrieve_pipeline.py：
+        锚点保留 → 字面/向量 RRF → MMR → earliest/按天 → 负向过滤 → 前后文。
         """
         text = (text or "").strip()
         if len(text) < 2:
             return []
 
-        expansions = await self._expand_terms(text, use_llm=use_llm)
-        terms = query_mod.build_terms(text, expansions)
-        per_term = max(10, int(limit) * 2)
+        expansions = list(await self._expand_terms(text, use_llm=use_llm,
+                                                   uid=uid))
+        for value in self.entities_for(uid).expand(text, limit=8):
+            if value not in expansions:
+                expansions.append(value)
+        for value in self.synonyms_for(uid).expand(text, limit=8):
+            if value not in expansions:
+                expansions.append(value)
 
-        literal = []
-        for term in terms:
-            try:
-                literal.append(self.index.search(term, limit=per_term, session=session))
-            except Exception:
-                literal.append([])
+        # SQLite / FTS / 向量都在线程里跑；pipeline 内部会批量回表。
+        hits = await asyncio.to_thread(
+            retrieve_mod.retrieve,
+            self.index, text,
+            uid=uid, limit=max(1, int(limit or 20)),
+            vectors=self.vectors, embedder=self.embedder,
+            expansions=expansions,
+            use_vector=True, use_mmr=True, boost=True,
+            expand_context=True, candidate_multiplier=2.0,
+            anchor_count=5)
+        return hits[:max(1, int(limit or 20))]
 
-        vector_hits: list[tuple[str, float]] = []
-        try:
-            query_vector = self.embedder.vector(text)
-            raw = self.vectors.search(query_vector, limit=per_term)
-            if session and raw:
-                sessions = self.index.sessions_of([fp for fp, _ in raw])
-                raw = [(fp, score) for fp, score in raw
-                       if sessions.get(fp, session) == session]
-            vector_hits = raw
-        except Exception:
-            vector_hits = []
-
-        return search_mod.combine(
-            literal, vector_hits, fetch=self.index.get,
-            window=query_mod.time_window(text), limit=limit)
-
-    def vectorize_recent(self, limit: int = 400) -> int:
+    def vectorize_recent(self, limit: int = 400, uid: str = "default") -> int:
         """给最近的事件补向量。纯本地计算，几十毫秒，扔后台跑。"""
         try:
-            events = self.vault.recent_events(limit)
+            events = self.vault.recent_events(limit, uid)
             if not events:
                 return 0
             fingerprints = [str(e.get("fp") or "") for e in events]
-            known = self.vectors.has_many(fingerprints)
+            known = self.vectors.has_many(fingerprints, uid)
             todo = [e for e in events
                     if str(e.get("fp") or "") and str(e["fp"]) not in known]
             if not todo:
                 return 0
             payload = [(str(e["fp"]), self.embedder.vector(e.get("text", "")))
                        for e in todo]
-            return self.vectors.put(payload)
+            return self.vectors.put(payload, uid=uid)
         except Exception as exc:
             logger.debug(f"[all_memory] 向量化失败: {exc}")
             return 0
 
-    def vectorize_missing(self, batch: int = 400) -> int:
+    def vectorize_missing(self, batch: int = 400, uid: str = "default") -> int:
         """
         从最早的一天开始补，补满 batch 条就返回，下次接着来。
-
-        按天读、按天查，不把整库塞进内存——历史再长也不会一下吃爆。
         """
         written = 0
         payload: list[tuple[str, list[float]]] = []
         try:
-            for day in self.vault.days():
+            for day in self.vault.days(uid):
                 if written >= batch:
                     break
-                events = self.vault.read_day(day)
+                events = self.vault.read_day(day, uid)
                 if not events:
                     continue
                 fingerprints = [str(e.get("fp") or "") for e in events]
-                known = self.vectors.has_many(fingerprints)
+                known = self.vectors.has_many(fingerprints, uid)
                 for event in events:
                     fp = str(event.get("fp") or "")
                     if not fp or fp in known:
@@ -1456,17 +1664,17 @@ class AllMemory(Star):
             logger.debug(f"[all_memory] 向量补齐失败: {exc}")
         if payload:
             try:
-                self.vectors.put(payload)
+                self.vectors.put(payload, uid=uid)
             except Exception as exc:
                 logger.debug(f"[all_memory] 向量写入失败: {exc}")
                 return 0
         return written
 
-    async def _vector_backfill(self) -> None:
-        """启动后把历史补齐。补完就退出；增量由每轮结束时的 vectorize_recent 负责。"""
+    async def _vector_backfill(self, uid: str) -> None:
+        """启动后把这个 id 的历史补齐。补完就退出；增量由每轮结束负责。"""
         while True:
             try:
-                done = await asyncio.to_thread(self.vectorize_missing, 400)
+                done = await asyncio.to_thread(self.vectorize_missing, 400, uid)
             except Exception:
                 return
             if not done:
@@ -1474,39 +1682,42 @@ class AllMemory(Star):
             logger.info(f"[all_memory] 已补 {done} 条向量，继续…")
             await asyncio.sleep(0)
 
-    def _ensure_vector_backfill(self) -> None:
-        """第一次用到检索时把补齐任务拉起来，只拉一次。"""
-        if self._vector_started:
+    def _ensure_vector_backfill(self, uid: str) -> None:
+        """第一次用到检索时把补齐任务拉起来，每个 id 只拉一次。"""
+        if uid in self._vector_started:
             return
         try:
-            asyncio.create_task(self._vector_backfill())
-            self._vector_started = True
+            asyncio.create_task(self._vector_backfill(uid))
+            self._vector_started.add(uid)
         except RuntimeError:
             pass
 
-    def _ensure_media_backfill(self) -> None:
+    def _ensure_media_backfill(self, uid: str) -> None:
         """附件库是空的时候，自动从宿主库补一次历史图片。"""
-        if self._media_backfill_started:
+        if uid in self._media_backfill_started:
             return
         try:
-            asyncio.create_task(self._media_backfill())
-            self._media_backfill_started = True
+            asyncio.create_task(self._media_backfill(uid))
+            self._media_backfill_started.add(uid)
         except RuntimeError:
             pass
 
-    async def _media_backfill(self) -> None:
+    async def _media_backfill(self, uid: str) -> None:
         """
         只在附件库为空时跑：旧版本的归档是坏的，库里一张图都没有，
         而宿主库里图是 base64 内嵌的，补得回来。补过就不再动。
         """
         try:
-            if self.media.stats().get("files"):
+            store = self.media_for(uid)
+            if os.path.isdir(store.dir) and any(
+                    n.endswith(".jsonl") for n in os.listdir(store.dir)):
                 return
             path = self._find_astrbot_db()
             if not path:
                 return
             result = await asyncio.to_thread(
-                importer.backfill_media_from_astrbot, path, self.media)
+                importer.backfill_media_from_astrbot, path, store,
+                ids=self.ids)
             if result.get("saved"):
                 logger.info(
                     f"[all_memory] 历史附件回填 {result['saved']} 张"
@@ -1517,7 +1728,51 @@ class AllMemory(Star):
         except Exception as exc:
             logger.debug(f"[all_memory] 附件回填失败: {exc}")
 
-    def _earliest_hits(self, hits: list[dict], limit: int = 8) -> list[dict]:
+    def _expand_hits(self, hits: list[dict], uid: str = "default",
+                     span: int = 1, max_hits: int = 3) -> list[dict]:
+        """
+        给最相关的前几条命中补前后文。
+
+        检索本身返回的是一条条孤立消息；问“那天几点回来”时，只有
+        “我回来了”不够，前面“我出门了”才是上下文。这里按窗口合并、
+        去重，命中项标 is_hit，邻居标 is_context。
+        """
+        if not hits:
+            return []
+        span = max(0, min(int(span or 0), 3))
+        max_hits = max(0, min(int(max_hits or 0), 8))
+        out: list[dict] = []
+        seen: set[str] = set()
+        for rank, hit in enumerate(hits):
+            fp = str(hit.get("fp") or "")
+            if not fp:
+                continue
+            if rank >= max_hits or span == 0:
+                if fp not in seen:
+                    seen.add(fp)
+                    out.append(dict(hit))
+                continue
+            window = [dict(hit)]
+            try:
+                for item in self.index.neighbors(fp, span=span, uid=uid):
+                    neighbor = dict(item)
+                    neighbor["is_context"] = True
+                    neighbor["is_hit"] = False
+                    window.append(neighbor)
+            except Exception:
+                pass
+            window.sort(key=lambda item: str(item.get("ts") or ""))
+            for item in window:
+                item_fp = str(item.get("fp") or "")
+                if not item_fp or item_fp in seen:
+                    continue
+                seen.add(item_fp)
+                item.setdefault("is_hit", item_fp == fp)
+                out.append(item)
+        return out
+
+    def _earliest_hits(self, hits: list[dict], limit: int = 8,
+                       uid: str = "default") -> list[dict]:
         """
         把最早那天的开头几条排到召回最前面。
 
@@ -1525,10 +1780,10 @@ class AllMemory(Star):
         所以这条不靠模型自觉：只要识别出意图，证据直接递到眼前。
         """
         try:
-            day = self.index.earliest_day()
+            day = self.index.earliest_day(uid)
             if not day:
                 return hits
-            seeds = self.index.day_messages(day, limit=limit)
+            seeds = self.index.day_messages(day, limit=limit, uid=uid)
             if not seeds:
                 return hits
             seen = {str(hit.get("fp")) for hit in hits}
@@ -1546,7 +1801,8 @@ class AllMemory(Star):
             logger.debug(f"[all_memory] 最早记忆补位失败: {exc}")
             return hits
 
-    def _day_hits(self, hits: list[dict], day: str, limit: int = 20) -> list[dict]:
+    def _day_hits(self, hits: list[dict], day: str, limit: int = 20,
+                  uid: str = "default") -> list[dict]:
         """
         把某一天的原话排到召回最前面。
 
@@ -1557,7 +1813,7 @@ class AllMemory(Star):
         只取两头会漏掉"下午两点我回来了"这种。
         """
         try:
-            items = self.index.day_messages(day, limit=200)
+            items = self.index.day_messages(day, limit=200, uid=uid)
             if not items:
                 return hits
 
@@ -1584,7 +1840,7 @@ class AllMemory(Star):
             logger.debug(f"[all_memory] 按天补位失败: {exc}")
             return hits
 
-    def _flush_failed(self) -> int:
+    def _flush_failed(self, uid: str) -> int:
         """
         把之前归档失败的内容补写进去。
 
@@ -1592,8 +1848,9 @@ class AllMemory(Star):
         写成功才删文件，写不进去就留着下次再试。
         """
         written = 0
+        queue = self.failed_for(uid)
         try:
-            for path, data in self.failed.pending(limit=3):
+            for path, data in queue.pending(limit=3):
                 items = data.get("items") or []
                 parsed = [
                     {"idx": i, "role": str(item.get("role") or "user"),
@@ -1602,13 +1859,13 @@ class AllMemory(Star):
                     if str(item.get("content") or "").strip()
                 ]
                 if not parsed:
-                    self.failed.discard(path)
+                    queue.discard(path)
                     continue
                 stats = sync.sync(self.vault, self.index, parsed,
                                   str(data.get("persona") or ""),
                                   session=str(data.get("session") or ""),
-                                  origin="retry")
-                self.failed.discard(path)
+                                  origin="retry", uid=uid)
+                queue.discard(path)
                 written += int(stats.get("new") or 0)
             if written:
                 logger.info(f"[all_memory] 重试队列补写 {written} 条")
@@ -1616,7 +1873,8 @@ class AllMemory(Star):
             logger.warning(f"[all_memory] 补写重试队列失败: {exc}")
         return written
 
-    def _capture_turn_media(self, event, parsed: list[dict], session: str) -> None:
+    def _capture_turn_media(self, event, parsed: list[dict], session: str,
+                            uid: str) -> None:
         """
         把这一轮用户消息里的图片/语音落盘，键 = 那条消息的指纹。
 
@@ -1633,7 +1891,7 @@ class AllMemory(Star):
                 return
             msg_fp = vault_mod.fp_of(f"user\x00{target['content']}")
             task = asyncio.create_task(
-                self.media.ingest(msg_fp, session, sources))
+                self.media_for(uid).ingest(msg_fp, session, sources))
             task.add_done_callback(_log_task_error)
         except Exception as exc:
             logger.debug(f"[all_memory] 附件归档失败: {exc}")
@@ -1691,27 +1949,48 @@ class AllMemory(Star):
                 return str(value).strip()
         return ""
 
-    def _active_facts(self, session: str = "", query: str = "") -> list[dict]:
-        """
-        按「身份 > 关系 > 偏好 > 其他 > 事件」排序，同权重内新的在前。
+    @staticmethod
+    def _sender_name_of(event) -> str:
+        """软件读不到 ID 时，用账户名称当文件夹名。"""
+        for getter in ("get_sender_name", "get_sender_nickname"):
+            fn = getattr(event, getter, None)
+            if callable(fn):
+                try:
+                    value = fn()
+                except Exception:
+                    value = None
+                if value:
+                    return str(value).strip()
 
-        排序之前先按身份过滤：只留这个会话看得见的。
-        群聊里 A 的私事不能漏到 B 的对话里，所以这一步不能省。
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        for attr in ("nickname", "card", "name", "display_name", "user_name"):
+            value = getattr(sender, attr, None)
+            if value:
+                return str(value).strip()
+        return ""
 
-        带了本轮的话时，再按"沾不沾边"往前排——几百条全量塞得下，
-        但相关的内容放前面，模型读起来更有用；等上千条，这一步就是省预算的关键。
+    def _active_facts(self, uid: str = "default", query: str = "",
+                      extra_subjects=None, budget: int = 0) -> list[dict]:
         """
-        facts = list(self.facts.latest().values())
-        if session:
-            facts = self._visible_facts(facts, session)
+        只取这个 id 的人物卡，按「身份 > 关系 > 偏好 > 其他 > 事件」排序，
+        同权重内新的在前；给了 budget 时按核心/事件分层选择。
+        """
+        facts = list(self.facts_for(uid).latest().values())
         if query:
-            return search_mod.rank_facts(facts, query_mod.split_terms(query))
-        facts.sort(key=lambda f: (extract.kind_weight(f.get("kind")),
-                                  str(f.get("extracted_at", ""))),
-                   reverse=True)
+            aliases = self.entities_for(uid).expand(query, limit=8)
+            aliases += self.synonyms_for(uid).expand(query, limit=8)
+            terms = query_mod.build_terms(query, aliases)
+            facts = search_mod.rank_facts(facts, terms)
+        else:
+            facts.sort(key=lambda f: (extract.kind_weight(f.get("kind")),
+                                      str(f.get("extracted_at", ""))),
+                       reverse=True)
+        if budget > 0:
+            return inject.select_facts(facts, budget)
         return facts
 
-    def _visible_facts(self, facts: list[dict], session: str) -> list[dict]:
+    def _visible_facts(self, facts: list[dict], session: str,
+                       extra_subjects=None) -> list[dict]:
         """把"谁能看见"需要的两个索引一次性查出来，别在循环里查库。"""
         fingerprints: list[str] = []
         for fact in facts:
@@ -1721,14 +2000,20 @@ class AllMemory(Star):
         except Exception:
             source_session = {}
         try:
-            subjects = self.index.subjects(session)
+            subjects = set(self.index.subjects(session) or ())
         except Exception:
             subjects = set()
+        # 本轮说话的人可能还没写进索引（新会话第一条），先算进来；
+        # 否则「关于我」的 people 事实会因为“本会话没这个人”被静默过滤。
+        for value in extra_subjects or ():
+            value = str(value or "").strip()
+            if value:
+                subjects.add(value)
         # 提炼时会给历史消息补一个推算的 sender，这里必须同步认它，
         # 否则事实带着这个 ID，却因为"本会话没这个人"被过滤掉——静默丢记忆。
         guess = sync.infer_sender(session, subjects)
         if guess:
-            subjects = set(subjects) | {guess}
+            subjects.add(guess)
         return extract.visible_facts(facts, session, subjects, source_session)
 
     def _block_budget(self, window: int, fraction: float, calibrator) -> int:
@@ -1756,7 +2041,7 @@ class AllMemory(Star):
                 return "检索词太短，请换一个更具体的词。"
             limit = max(1, min(int(limit or 20), 60))
             hits = await self.retrieve(
-                query, session=self._session_of(event), limit=limit,
+                query, uid=self._uid(event), limit=limit,
                 use_llm=bool(self._cfg("recall_expand")))
             if not hits:
                 return (f"没有找到与「{query}」相关的记忆。"
@@ -1789,16 +2074,18 @@ class AllMemory(Star):
             offset(int): 按天读的起始条数，翻页用，默认 0
         """
         try:
+            uid = self._uid(event)
             day = (day or "").strip()
             if day:
                 start = max(0, int(offset or 0))
-                items = self.index.day_messages(day, limit=40, offset=start)
+                items = self.index.day_messages(day, limit=40, offset=start,
+                                                uid=uid)
                 if not items:
                     if start:
                         return f"{day} 第 {start} 条之后没有更多了。"
                     return (f"{day} 没有记录。先用 memory_timeline 看有哪几天，"
                             "或用 search_memory 搜关键词。")
-                total = self.index.day_count(day)
+                total = self.index.day_count(day, uid)
                 lines = [f"[{item['ts']}] {item['role']}：{item['text']}"
                          for item in items]
                 tail = ""
@@ -1811,12 +2098,12 @@ class AllMemory(Star):
             memory_id = (id or "").strip().strip("[]")
             if not memory_id:
                 return "要读取就给我 id（search_memory 结果的编号）或 day（YYYY-MM-DD）。"
-            target = self.index.get(memory_id)
+            target = self.index.get(memory_id, uid)
             if not target:
                 return f"没有找到编号为 {memory_id} 的记忆，编号可能已经过期。"
 
             lines = []
-            for item in self.index.neighbors(memory_id, span=span):
+            for item in self.index.neighbors(memory_id, span=span, uid=uid):
                 lines.append(f"[{item['ts']}] {item['role']}：{item['text']}")
 
             marker = f"【原文】{target['ts']} {target['role']}：\n{target['text']}"
@@ -1840,7 +2127,7 @@ class AllMemory(Star):
             detail_days(int): 最近多少天按天列出，更早的按月汇总，默认 30
         """
         try:
-            rows = self.index.day_summary(days=None)
+            rows = self.index.day_summary(days=None, uid=self._uid(event))
             if not rows:
                 return "记忆库里还没有任何记录。"
             block = inject.build_map_block(
@@ -1855,29 +2142,69 @@ class AllMemory(Star):
     @filter.command("allmem")
     async def cmd_status(self, event: AstrMessageEvent):
         try:
-            session = self._session_of(event)
-            stats = self.vault.stats()
-            facts = len(self.facts.all_facts())
-            digest = self.summaries.load(session)
+            uid = self._uid(event)
+            stats = self.vault.stats(uid)
+            facts = len(self.facts_for(uid).all_facts())
+            digest = self.summaries_for(uid).load()
             digest_chars = len(str(digest.get("text") or ""))
-            state = self.states.load(session)
+            state = self.states.load(uid)
             plan = state.get("last_plan") or {}
-            queued = self.failed.count()
+            queued = self.failed_for(uid).count()
+            actual_tokens = (int(state.get("last_prompt_tokens", 0) or 0)
+                             or self._db_token_usage(self._session_of(event)))
+            window = self._window()
             lines = [
                 f"原始层：{stats['events']} 条 / {stats['days']} 天",
                 f"提炼层：{facts} 条事实",
                 f"前情纪要：{digest_chars} 字"
                 + (f"（覆盖到 {digest.get('covered_until', '')[:16]}）"
                    if digest_chars else "（还没有）"),
-                f"索引层：{self.index.count()} 条",
-                f"向量层：{self.vectors.count()} 条（本地哈希）",
-                f"窗口：{self._window() or '未配置'}",
+                f"索引层：{self.index.count(uid)} 条",
+                f"向量层：{self.vectors.count(uid)} 条（本地哈希）",
+                f"窗口：{window or '未配置'}",
+                (f"真实注入：{actual_tokens} tok"
+                 + (f"（{actual_tokens / window * 100:.1f}%）" if window else "")
+                 if actual_tokens else
+                 "真实注入：还没读到（本轮会按字符估算）"),
+                "全局接管：" + {
+                    "on": "开",
+                    "off": "关",
+                    "auto": "关（首次裁剪自动开）",
+                }.get(self.global_takeover_state().get("mode"), "?"),
                 f"上次：{plan.get('pressure', 0) * 100:.1f}% "
                 f"{'已裁剪' if plan.get('applied') else '未触发'}",
             ]
             if queued:
                 lines.append(f"待补写：{queued} 轮（下条消息会自动补）")
             lines.append(f"目录：{self.root}")
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            yield event.plain_result(f"读取失败: {exc}")
+
+    @filter.command("allmem_recall")
+    async def cmd_recall(self, event: AstrMessageEvent):
+        """看上一轮检索到底贡献了什么。"""
+        try:
+            state = self.states.load(self._uid(event))
+            trace = state.get("last_recall") or {}
+            if not trace:
+                yield event.plain_result(
+                    "还没有检索记录；先聊一轮，且要处于接管模式。")
+                return
+            lines = [
+                f"时间：{trace.get('at', '')}",
+                f"问题：{trace.get('query', '')}",
+                f"候选：{trace.get('candidates', 0)}",
+                f"已在本轮上下文（剔除）：{trace.get('known', 0)}",
+                f"前后文新增：{trace.get('expanded', 0)}",
+                f"最终注入：{trace.get('final', 0)} 条 / "
+                f"{trace.get('chars', 0)} 字",
+            ]
+            fps = [x for x in (trace.get("fps") or []) if x]
+            if fps:
+                lines.append("最终指纹：" + "、".join(fps))
+            if not trace.get("final"):
+                lines.append("结论：这轮没有新增检索内容，回答主要来自上下文。")
             yield event.plain_result("\n".join(lines))
         except Exception as exc:
             yield event.plain_result(f"读取失败: {exc}")
@@ -1952,6 +2279,63 @@ class AllMemory(Star):
         except Exception as exc:
             yield event.plain_result(f"验收失败: {exc}")
 
+    @filter.command("allmem_manifest")
+    async def cmd_manifest(self, event: AstrMessageEvent):
+        """给当前数据目录生成/刷新 manifest.json + README_M.md。"""
+        try:
+            meta = self._manifest_meta()
+            data = await asyncio.to_thread(
+                manifest_mod.write, self.root,
+                self._plugin_version(), meta["models"],
+                meta["prompt_versions"])
+            counts = data.get("counts") or {}
+            yield event.plain_result(
+                "manifest 已写入：\n"
+                f"{os.path.join(self.root, manifest_mod.MANIFEST_NAME)}\n"
+                f"事件 {counts.get('events', 0)} / 事实 {counts.get('facts', 0)} / "
+                f"纪要 {counts.get('summaries', 0)} / 文件 {counts.get('files', 0)}")
+        except Exception as exc:
+            yield event.plain_result(f"生成失败: {exc}")
+
+    @filter.command("allmem_verify_m")
+    async def cmd_verify_m(self, event: AstrMessageEvent, target: str = ""):
+        """校验当前目录或导出 zip 里的 all_memory/。"""
+        try:
+            target = (target or "").strip().strip('"')
+            if target and os.path.isfile(target):
+                result = await asyncio.to_thread(
+                    manifest_mod.verify_zip, target)
+                label = os.path.basename(target)
+            elif target and os.path.isdir(target):
+                result = await asyncio.to_thread(
+                    manifest_mod.verify, target, False)
+                label = target
+            else:
+                result = await asyncio.to_thread(
+                    manifest_mod.verify, self.root, False)
+                label = self.root
+
+            counts = result.get("counts") or {}
+            lines = [
+                f"记忆体校验：{'✅ 通过' if result.get('ok') else '❌ 失败'}",
+                f"位置：{label}",
+                f"schema：{result.get('schema') or '?'}",
+                f"事件 {counts.get('events', 0)} / 事实 {counts.get('facts', 0)} / "
+                f"纪要 {counts.get('summaries', 0)} / 附件 {counts.get('blobs', 0)}",
+                f"校验文件 {result.get('checked_files', 0)} 个",
+            ]
+            errors = result.get("errors") or []
+            warnings = result.get("warnings") or []
+            if errors:
+                lines.append(f"错误 {result.get('error_count', len(errors))} 条：")
+                lines.extend(f"- {item}" for item in errors[:8])
+            if warnings:
+                lines.append(f"警告 {result.get('warning_count', len(warnings))} 条：")
+                lines.extend(f"- {item}" for item in warnings[:5])
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            yield event.plain_result(f"校验失败: {exc}")
+
     # ------------------------------------------------------------ 来源查找
 
     def _find_astrbot_db(self) -> str:
@@ -1966,18 +2350,81 @@ class AllMemory(Star):
             return configured
 
         root = self.astrbot_data_root()
-        if not root:
-            return configured
+        roots = []
+        # 插件数据目录就是 <data>/all_memory；宿主 DB 在它的父目录。
+        # 这个位置最确定，优先于可能指错的 get_astrbot_data_path()。
+        parent = os.path.dirname(os.path.abspath(self.root))
+        if parent:
+            roots.append(parent)
+        if root and root not in roots:
+            roots.append(root)
+        for base in roots:
+            try:
+                names = [n for n in os.listdir(base)
+                         if n.startswith("data_v") and n.endswith(".db")]
+            except OSError:
+                continue
+            if not names:
+                continue
+            paths = [os.path.join(base, n) for n in names]
+            paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            return paths[0]
+        return configured
+
+    def _db_token_usage(self, session: str) -> int:
+        """
+        直接读 AstrBot conversations.token_usage。
+
+        这是宿主上一次请求真正注入的 token 总量（含工具定义），比字符估算准。
+        缓存 10 秒，避免每一轮都开一次 SQLite。
+        """
+        key = str(session or "")
+        now = time.monotonic()
+        cached = self._token_usage_cache.get(key)
+        if cached and now - cached[0] < 10:
+            return cached[1]
+
+        path = self._find_astrbot_db()
+        if not path or not os.path.isfile(path):
+            return 0
+        value = 0
         try:
-            names = [n for n in os.listdir(root)
-                     if n.startswith("data_v") and n.endswith(".db")]
-        except OSError:
-            return configured
-        if not names:
-            return configured
-        paths = [os.path.join(root, n) for n in names]
-        paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        return paths[0]
+            # mode=ro：绝不写宿主库，也不触发建库
+            uri = "file:" + path.replace("\\", "/") + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+            try:
+                row = conn.execute(
+                    "SELECT token_usage FROM conversations "
+                    "WHERE user_id=? ORDER BY updated_at DESC LIMIT 1",
+                    (key,)).fetchone()
+                if not row:
+                    # 某些平台会给 user_id 加前缀/别名，按尾号再兜一次
+                    tail = key.split(":")[-1]
+                    if tail and tail != key:
+                        row = conn.execute(
+                            "SELECT token_usage FROM conversations "
+                            "WHERE user_id LIKE ? ORDER BY updated_at DESC LIMIT 1",
+                            (f"%{tail}",)).fetchone()
+                if row and row[0]:
+                    value = int(row[0])
+                if not value:
+                    # 最后兜底：宿主如果只保留一条活动对话，直接取最新那条。
+                    row = conn.execute(
+                        "SELECT token_usage FROM conversations "
+                        "ORDER BY updated_at DESC LIMIT 1").fetchone()
+                    if row and row[0]:
+                        value = int(row[0])
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError, ValueError):
+            value = 0
+        if not value and key not in self._token_debugged:
+            self._token_debugged.add(key)
+            logger.warning(
+                f"[all_memory] 读不到宿主 token：db={path or '空'} "
+                f"session={key!r} exists={bool(path and os.path.isfile(path))}")
+        self._token_usage_cache[key] = (now, value)
+        return value
 
     def _find_beyond_dir(self) -> str:
         """找 memory_beyond 的数据目录（用来做超集校验）。"""
@@ -2006,18 +2453,22 @@ class AllMemory(Star):
                 yield event.plain_result(f"路径不存在：{path}")
                 return
 
+            uid = self._uid(event)
+            session = self._session_of(event)
             if os.path.isdir(path):
-                stats = importer.import_beyond(path, self.vault, self.index)
+                stats = importer.import_beyond(path, self.vault, self.index,
+                                               uid=uid)
                 yield event.plain_result(
-                    f"导入 memory_beyond：\n"
+                    f"导入 memory_beyond（id {uid}）：\n"
                     f"扫描文件 {stats['files']} 个\n"
                     f"新增事件 {stats['events']} 条\n"
                     + (f"错误 {len(stats['errors'])} 个"
                        if stats["errors"] else "无错误"))
             else:
-                stats = importer.import_astrbot(path, self.vault, self.index)
+                stats = importer.import_astrbot(path, self.vault, self.index,
+                                                session=session, uid=uid)
                 yield event.plain_result(
-                    f"导入 AstrBot 数据库：\n"
+                    f"导入 AstrBot 数据库（id {uid}）：\n"
                     f"扫描表 {stats['tables']} 个\n"
                     f"新增事件 {stats['events']} 条\n"
                     f"跳过表 {len(stats['skipped_tables'])} 个\n"
@@ -2034,7 +2485,7 @@ class AllMemory(Star):
                 yield event.plain_result("用法：/allmem_search 关键词")
                 return
             hits = await self.retrieve(
-                keyword, session=self._session_of(event), limit=8,
+                keyword, uid=self._uid(event), limit=8,
                 use_llm=bool(self._cfg("recall_expand")))
             if not hits:
                 yield event.plain_result(f"没有找到「{keyword}」")
@@ -2050,7 +2501,7 @@ class AllMemory(Star):
     @filter.command("allmem_facts")
     async def cmd_facts(self, event: AstrMessageEvent, keyword: str = ""):
         try:
-            latest = list(self.facts.latest().values())
+            latest = list(self.facts_for(self._uid(event)).latest().values())
             keyword = (keyword or "").strip()
             if keyword:
                 latest = [f for f in latest if keyword in str(f.get("claim", ""))]
@@ -2068,10 +2519,119 @@ class AllMemory(Star):
         except Exception as exc:
             yield event.plain_result(f"读取失败: {exc}")
 
+    @filter.command("allmem_entities")
+    async def cmd_entities(self, event: AstrMessageEvent,
+                           action: str = "", value: str = ""):
+        """实体/别名词典：不带参数列出；add/remove/suggest。"""
+        try:
+            uid = self._uid(event)
+            store = self.entities_for(uid)
+            action = (action or "").strip().lower()
+            value = (value or "").strip()
+
+            if action == "suggest":
+                facts = list(self.facts_for(uid).latest().values())
+                names = EntityStore.suggest(facts)
+                if not names:
+                    yield event.plain_result("没有从事实里抽出候选实体")
+                    return
+                yield event.plain_result(
+                    "候选实体（只是建议，未写入）：\n- " + "\n- ".join(names)
+                    + "\n\n添加：/allmem_entities add 规范名 别名1,别名2")
+                return
+
+            if action == "add":
+                head = value.replace("，", ",").split(None, 1)
+                if not head:
+                    yield event.plain_result(
+                        "用法：/allmem_entities add 规范名 别名1,别名2")
+                    return
+                canonical = head[0]
+                aliases = []
+                if len(head) > 1:
+                    aliases = [x.strip() for x in
+                               head[1].replace("、", ",").split(",")
+                               if x.strip()]
+                item = store.add(canonical, aliases)
+                yield event.plain_result(
+                    f"已添加：{item['canonical']}（{item['type']}）"
+                    + (f" 别名：{'、'.join(item['aliases'])}"
+                       if item["aliases"] else ""))
+                return
+
+            if action == "remove":
+                if not value:
+                    yield event.plain_result("用法：/allmem_entities remove 规范名")
+                    return
+                ok = store.remove(value)
+                yield event.plain_result("已删除" if ok else "没有这个实体")
+                return
+
+            items = store.all()
+            if not items:
+                yield event.plain_result(
+                    "还没有实体词典。\n"
+                    "添加：/allmem_entities add 规范名 别名1,别名2\n"
+                    "候选：/allmem_entities suggest")
+                return
+            lines = ["实体词典："]
+            for item in items[:40]:
+                aliases = "、".join(item.get("aliases") or [])
+                lines.append(f"- {item['canonical']}（{item.get('type', '')}）"
+                             + (f"：{aliases}" if aliases else ""))
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            yield event.plain_result(f"实体词典操作失败: {exc}")
+
+    @filter.command("allmem_synonyms")
+    async def cmd_synonyms(self, event: AstrMessageEvent,
+                           action: str = "", value: str = ""):
+        """同义词分组：不带参数列出；add/remove。"""
+        try:
+            store = self.synonyms_for(self._uid(event))
+            action = (action or "").strip().lower()
+            value = (value or "").strip()
+            if action == "add":
+                head = value.replace("，", ",").split(None, 1)
+                if not head:
+                    yield event.plain_result(
+                        "用法：/allmem_synonyms add 主词 同义词1,同义词2")
+                    return
+                terms = []
+                if len(head) > 1:
+                    terms = [x.strip() for x in
+                             head[1].replace("、", ",").split(",")
+                             if x.strip()]
+                item = store.add(head[0], terms)
+                yield event.plain_result(
+                    f"已添加：{item['canonical']} → "
+                    f"{'、'.join(item['terms']) or '（无别名）'}")
+                return
+            if action == "remove":
+                if not value:
+                    yield event.plain_result(
+                        "用法：/allmem_synonyms remove 主词")
+                    return
+                ok = store.remove(value)
+                yield event.plain_result("已删除" if ok else "没有这个同义词组")
+                return
+            groups = store.all()
+            if not groups:
+                yield event.plain_result("还没有同义词组")
+                return
+            lines = ["同义词组："]
+            for item in groups[:50]:
+                lines.append(
+                    f"- {item['canonical']}："
+                    + ("、".join(item.get("terms") or []) or "（无）"))
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            yield event.plain_result(f"同义词操作失败: {exc}")
+
     @filter.command("allmem_show")
     async def cmd_show(self, event: AstrMessageEvent, fact_id: str = ""):
         try:
-            fact = self.facts.load((fact_id or "").strip())
+            fact = self.facts_for(self._uid(event)).load((fact_id or "").strip())
             if not fact:
                 yield event.plain_result("没有这条事实")
                 return
@@ -2086,10 +2646,10 @@ class AllMemory(Star):
 
     @filter.command("allmem_reextract")
     async def cmd_reextract(self, event: AstrMessageEvent):
-        """手动全量重提炼：扫当前全量库，归档旧版后整体替换。"""
+        """手动全量重提炼：扫当前 id 的全部历史，归档旧版后整体替换。"""
         try:
-            session = self._session_of(event)
-            info = self.start_refine(session, reason="manual")
+            uid = self._uid(event)
+            info = self.start_refine(uid, reason="manual", replace=True)
             if not info.get("ok"):
                 yield event.plain_result(info.get("error") or "启动失败")
                 return
@@ -2100,17 +2660,44 @@ class AllMemory(Star):
         except Exception as exc:
             yield event.plain_result(f"启动失败: {exc}")
 
+    @filter.command("allmem_repair")
+    async def cmd_repair(self, event: AstrMessageEvent):
+        """清理旧纪要的重复/占位、合并近义事实（只动派生层）。"""
+        try:
+            uid = self._uid(event)
+            summary_info = await asyncio.to_thread(
+                self.summaries_for(uid).repair)
+            facts_info = await asyncio.to_thread(self.facts_for(uid).repair)
+            lines = []
+            if summary_info.get("ok"):
+                lines.append(
+                    f"纪要：{summary_info.get('before', 0)} → "
+                    f"{summary_info.get('after', 0)} 字，"
+                    f"清掉 {summary_info.get('removed', 0)} 字")
+            else:
+                lines.append(f"纪要：{summary_info.get('error') or '未修改'}")
+            if facts_info.get("ok"):
+                lines.append(
+                    f"事实：{facts_info.get('facts', 0)} 条，"
+                    f"合并 {facts_info.get('merged', 0)} 条；"
+                    f"保留最早的一条，其余标记 deleted")
+            else:
+                lines.append(f"事实：{facts_info.get('error') or '未修改'}")
+            yield event.plain_result("\n".join(lines))
+        except Exception as exc:
+            yield event.plain_result(f"修复失败: {exc}")
+
     @filter.command("allmem_summary")
     async def cmd_summary(self, event: AstrMessageEvent):
         """手动生成/更新前情纪要：滚动合并，只处理还没纪要过的部分。"""
         try:
-            session = self._session_of(event)
-            info = self.start_summary(session, reason="manual")
+            uid = self._uid(event)
+            info = self.start_summary(uid, reason="manual")
             if not info.get("ok"):
                 yield event.plain_result(info.get("error") or "启动失败")
                 return
             yield event.plain_result(
-                f"{info['message']}，旧纪要会滚动合并进来。\n"
+                f"{info['message']}。\n"
                 f"跑完去面板点「纪要」查看，或 /allmem 看字数。")
         except Exception as exc:
             yield event.plain_result(f"启动失败: {exc}")
@@ -2168,10 +2755,11 @@ class AllMemory(Star):
 
             sessions = list(result.get("sessions") or [])
             if sessions and self._cfg("takeover_after_restore"):
-                sessions.append(self._session_of(event))
-                enabled = self.enable_takeover(sessions)
+                enabled = self.enable_takeover(sessions + [self._session_of(event)])
                 if enabled:
-                    lines.append(f"已让 {enabled} 个会话进入接管模式（每轮带记忆）")
+                    lines.append("已开启全局接管：所有会话（含新会话）每轮带记忆")
+                else:
+                    lines.append("全局接管未开启：先填上下文窗口")
 
             if self._cfg("restore_personas_to_astrbot") and result.get("personas_added"):
                 persona_result = await self.sync_personas_to_astrbot()
@@ -2203,7 +2791,8 @@ class AllMemory(Star):
                 return
             yield event.plain_result("开始回填历史图片（只读宿主库，可能要一会儿）…")
             stats = await asyncio.to_thread(
-                importer.backfill_media_from_astrbot, path, self.media)
+                importer.backfill_media_from_astrbot, path,
+                self.media_for(self._uid(event)), ids=self.ids)
             lines = [
                 f"扫描会话 {stats['conversations']} 个，带图消息 {stats['messages']} 条",
                 f"图片 {stats['images']} 张：补入 {stats['saved']}，跳过 {stats['skipped']}",
@@ -2372,18 +2961,44 @@ def _log_task_error(task) -> None:
         logger.warning(f"[all_memory] 后台任务失败: {exc}")
 
 
+def _conversation_tokens(req) -> int:
+    """AstrBot 会在 conversation.token_usage 里留最近一次请求的总 token。"""
+    conversation = getattr(req, "conversation", None)
+    if conversation is None:
+        return 0
+    value = getattr(conversation, "token_usage", 0)
+    if isinstance(value, (int, float)) and value > 0:
+        return int(value)
+    return 0
+
+
+def _tool_schema_tokens(req) -> int:
+    """
+    AstrBot 的工具定义不塞在 system_prompt 里，而是在 req.func_tool。
+    不数它，面板会把「人格/工具」算得只剩人格，95k 的真实请求显示成 4.8%。
+    """
+    tool_set = getattr(req, "func_tool", None)
+    if not tool_set:
+        return 0
+    try:
+        schema = None
+        openai_schema = getattr(tool_set, "openai_schema", None)
+        if callable(openai_schema):
+            schema = openai_schema()
+        else:
+            tools = getattr(tool_set, "tools", None)
+            if tools:
+                schema = [tool.model_dump() if hasattr(tool, "model_dump")
+                          else tool for tool in tools]
+        if not schema:
+            return 0
+        raw = json.dumps(schema, ensure_ascii=False, separators=(",", ":"),
+                         default=str)
+        return estimate_tokens(raw)
+    except Exception:
+        return 0
+
+
 def _prompt_tokens(usage) -> int:
     """从不同形态的 usage 里抠出 prompt token 数。"""
-    if usage is None:
-        return 0
-    if isinstance(usage, dict):
-        for key in ("prompt_tokens", "input_tokens", "promptTokens"):
-            value = usage.get(key)
-            if isinstance(value, (int, float)) and value > 0:
-                return int(value)
-        return 0
-    for key in ("prompt_tokens", "input_tokens"):
-        value = getattr(usage, key, None)
-        if isinstance(value, (int, float)) and value > 0:
-            return int(value)
-    return 0
+    return usage_input_tokens(usage)

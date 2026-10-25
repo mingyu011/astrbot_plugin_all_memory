@@ -35,45 +35,101 @@ USAGE_HINT = (
 )
 
 
+def select_facts(facts: list[dict], budget: int) -> list[dict]:
+    """
+    事实超过预算时的完整选择策略。
+
+    核心事实（identity / relationship / preference）优先保留，
+    事件型事实按调用方已经排好的相关度顺序补；不再“超了就直接取最近”。
+    """
+    items = [f for f in (facts or []) if str(f.get("claim") or "").strip()]
+    if not items or budget <= 0:
+        return []
+    total = estimate_tokens(FACTS_HEADER) + sum(
+        estimate_tokens(f"- {str(f.get('claim', '')).strip()}") + 2
+        for f in items)
+    if total <= budget:
+        return items
+
+    from .extract import kind_weight, normalize_kind
+    core = [f for f in items
+            if normalize_kind(f.get("kind")) in
+            ("identity", "relationship", "preference")]
+    core.sort(key=lambda f: (kind_weight(f.get("kind")),
+                             str(f.get("extracted_at", ""))), reverse=True)
+    rest = [f for f in items if f not in core]
+
+    selected: list[dict] = []
+    used = estimate_tokens(FACTS_HEADER)
+    seen: set[str] = set()
+    for fact in core + rest:
+        key = str(fact.get("id") or fact.get("claim") or "")
+        if key in seen:
+            continue
+        claim = str(fact.get("claim", "")).strip().replace("\n", " ")
+        if not claim:
+            continue
+        cost = estimate_tokens(f"- {claim}") + 2
+        if used + cost > budget:
+            continue
+        seen.add(key)
+        selected.append(fact)
+        used += cost
+    return selected
+
+
 def build_summary_block(text: str, budget: int) -> str:
     """
     前情纪要。排在整个记忆块最前面——先给"前情"，再给"她是谁"，最后给细节。
 
-    装不下就按行截断（纪要本来就是一行一件事，截在哪一行都还是完整的）。
+    纪要只追加，文件会越来越长；这里**从最新往回装**，装不下就丢最旧的，
+    保证模型看到的是最近发生了什么（顺序仍然是时间正序）。
     """
     body = str(text or "").strip()
     if not body or budget <= 0:
         return ""
 
-    lines = [SUMMARY_HEADER]
     used = estimate_tokens(SUMMARY_HEADER) + estimate_tokens(SUMMARY_FOOTER)
-    for line in body.splitlines():
+    picked: list[str] = []
+    for line in reversed(body.splitlines()):
         line = line.strip()
         if not line:
             continue
         cost = estimate_tokens(line)
         if used + cost > budget:
             break
-        lines.append(line)
+        picked.append(line)
         used += cost
 
-    if len(lines) == 1:
+    if not picked:
         return ""
-    lines.append(SUMMARY_FOOTER)
+    picked.reverse()
+    lines = [SUMMARY_HEADER] + picked + [SUMMARY_FOOTER]
     return "\n".join(lines)
 
 
 def build_facts_block(facts: list[dict], budget: int) -> str:
     """
-    facts: [{claim, source_fp, updated_at, ...}]
+    facts: [{claim, source_fp, extracted_at, ...}]
     常驻块——每轮都带，这是「聪明」的主要来源。
+
+    超过预算时按「最近」取：新的优先，旧事实让位（原文仍在 vault 里）。
     """
     if not facts or budget <= 0:
         return ""
 
+    items = list(facts)
+    total = estimate_tokens(FACTS_HEADER) + sum(
+        estimate_tokens(f"- {str(f.get('claim', '')).strip()}") + 2
+        for f in items if str(f.get("claim", "")).strip())
+    if total > budget:
+        items.sort(key=lambda f: (
+            str(f.get("extracted_at") or f.get("updated_at") or ""),
+            str(f.get("id") or "")), reverse=True)
+
     lines = [FACTS_HEADER]
     used = estimate_tokens(FACTS_HEADER)
-    for fact in facts:
+    for fact in items:
         claim = str(fact.get("claim", "")).strip().replace("\n", " ")
         if not claim:
             continue
@@ -203,7 +259,8 @@ def build_recall_block(hits: list[dict], budget: int,
         if len(text) > max_chars:
             text = text[:max_chars] + "…"
         role = hit.get("role", "")
-        line = f"- [{hit.get('ts', '')}] {role}：{text}"
+        prefix = "【上下文】" if hit.get("is_context") else ""
+        line = f"- {prefix}[{hit.get('ts', '')}] {role}：{text}"
         cost = estimate_tokens(line)
         if used + cost > budget:
             break

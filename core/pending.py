@@ -13,19 +13,20 @@ import json
 import time
 import uuid
 
+from .ids import safe_component
+
 
 class FailedQueue:
-    """落盘的重试队列：一个失败轮次一个 JSON 文件。"""
+    """落盘的重试队列：一个失败轮次一个 JSON 文件，按 id 分目录。"""
 
-    def __init__(self, root: str):
-        self.dir = os.path.join(root, "failed")
+    def __init__(self, root: str, uid: str = "default"):
+        self.dir = os.path.join(root, "failed",
+                                safe_component(uid, fallback="default"))
         os.makedirs(self.dir, exist_ok=True)
 
     @staticmethod
     def _key(session: str) -> str:
-        safe = "".join(ch if ch.isalnum() or ch in "-_." else "_"
-                       for ch in (session or "default"))[:60]
-        return safe or "default"
+        return safe_component(session, fallback="default", limit=60)
 
     # ------------------------------------------------------------ 写
 

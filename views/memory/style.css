@@ -45,7 +45,7 @@ h3 { margin: 0 0 8px; font-size: 15px; }
   background: var(--ok); box-shadow: 0 0 10px var(--ok);
 }
 .brand .sub { color: var(--muted); font-size: 12px; }
-.actions { display: flex; gap: 8px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 
 button {
   font: inherit; color: var(--text); cursor: pointer;
@@ -203,6 +203,8 @@ input:focus { outline: none; border-color: var(--accent); }
 .chip.total { background: rgba(62, 207, 142, .14); color: var(--ok); }
 .chip.muted { background: transparent; color: var(--muted); border: 1px dashed var(--line); }
 button.tiny { padding: 1px 8px; font-size: 11px; border-radius: 999px; }
+button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.warn { border-color: var(--warn); color: var(--warn); }
 
 /* ---------- 底部策略条 ---------- */
 

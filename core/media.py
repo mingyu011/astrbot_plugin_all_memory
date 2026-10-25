@@ -20,6 +20,7 @@ import asyncio
 import mimetypes
 from urllib.parse import urlparse
 
+from .ids import safe_component
 from .vault import now
 
 # 常见的附件组件名 -> 归类
@@ -36,6 +37,21 @@ _SOURCE_ATTRS = ("url", "file", "path", "file_", "src")
 def base_fp(fp: str) -> str:
     """abc-2 → abc。同一句话重复说时，附件的键只算基础指纹。"""
     return str(fp or "").split("-", 1)[0]
+
+
+def stats_of(root: str) -> dict:
+    """所有 id 共用的附件本体统计（blobs 是全局去重的）。"""
+    count = 0
+    total = 0
+    blob_root = os.path.join(root, "blobs")
+    for dirpath, _dirs, files in os.walk(blob_root):
+        for name in files:
+            count += 1
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    return {"files": count, "bytes": total}
 
 
 def guess_kind(component) -> str:
@@ -142,9 +158,10 @@ def _urllib_get(url: str) -> bytes:
 
 
 class MediaStore:
-    def __init__(self, root: str):
+    def __init__(self, root: str, uid: str = "default"):
         self.root = root
-        self.dir = os.path.join(root, "media")
+        self.uid = safe_component(uid, fallback="default")
+        self.dir = os.path.join(root, "media", self.uid)
         os.makedirs(self.dir, exist_ok=True)
         os.makedirs(os.path.join(root, "blobs"), exist_ok=True)
 
@@ -222,14 +239,4 @@ class MediaStore:
         return out
 
     def stats(self) -> dict:
-        count = 0
-        total = 0
-        blob_root = os.path.join(self.root, "blobs")
-        for dirpath, _dirs, files in os.walk(blob_root):
-            for name in files:
-                count += 1
-                try:
-                    total += os.path.getsize(os.path.join(dirpath, name))
-                except OSError:
-                    pass
-        return {"files": count, "bytes": total}
+        return stats_of(self.root)

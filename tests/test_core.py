@@ -22,7 +22,12 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from core import budget, extract, importer, inject  # noqa: E402
+from core import ids as ids_mod  # noqa: E402
+from core import tokens as tokens_mod  # noqa: E402
+from core.entities import EntityStore  # noqa: E402
+from core.synonyms import SynonymStore  # noqa: E402
 from core import backup  # noqa: E402
+from core import manifest as manifest_mod  # noqa: E402
 from core import media as media_mod  # noqa: E402
 from core import pending as pending_mod  # noqa: E402
 from core import refine as refine_mod  # noqa: E402
@@ -30,6 +35,7 @@ from core import restore as restore_mod  # noqa: E402
 from core import settings as settings_mod  # noqa: E402
 from core import summary as summary_mod  # noqa: E402
 from core import query as query_mod  # noqa: E402
+from core import retrieve_pipeline as pipeline  # noqa: E402
 from core import search as search_mod  # noqa: E402
 from core import vectors as vectors_mod  # noqa: E402
 from datetime import datetime  # noqa: E402
@@ -37,6 +43,7 @@ from core import sync  # noqa: E402
 from core.index import Index  # noqa: E402
 from core.tokens import Calibrator, estimate_tokens  # noqa: E402
 from core.vault import Vault, fp_of  # noqa: E402
+from tools import m_read  # noqa: E402
 
 
 def _pick_tmp_base() -> str:
@@ -210,6 +217,20 @@ def test_budget_below_trigger_passthrough():
     assert plan.applied is False, "远未到阈值时不应改动上下文"
 
 
+def test_budget_prefers_trusted_provider_tokens():
+    """有宿主真实 token 时，80% 按真实量判断，不再按字符估算。"""
+    cal = Calibrator()
+    low = budget.decide(
+        _msgs(5), system_tokens=100, window=1000000, calibrator=cal,
+        trigger_ratio=0.8, total_ratio=0.4, trusted_tokens=95000)
+    assert low.applied is False, "真实 9.5 万 / 100 万 不该裁"
+
+    high = budget.decide(
+        _msgs(5), system_tokens=100, window=1000000, calibrator=cal,
+        trigger_ratio=0.8, total_ratio=0.4, trusted_tokens=850000)
+    assert high.applied is True, "真实 85 万 / 100 万 应该裁"
+
+
 def test_facts_ratio_fixed_at_ten_percent():
     """facts 预算固定 10%，不再随裁剪次数增长。"""
     assert budget.facts_ratio_for(0) == 0.10
@@ -283,6 +304,18 @@ def test_total_request_tokens_no_double_count():
 
     assert budget.total_request_tokens(0, 0, 0) == 0
     assert budget.total_request_tokens(-5, 10, 0) == 10, "负值不该把合计拉低"
+
+
+def test_takeover_mode_states():
+    """全局接管要显示的三种状态：自动 / 已开 / 手动关。"""
+    assert budget.takeover_mode({}) == "auto"
+    assert budget.takeover_mode({"takeover_manual": "", "trimmed_mode": False}) == "auto"
+    assert budget.takeover_mode({"trimmed_mode": True}) == "on"
+    assert budget.takeover_mode({"takeover_manual": "on",
+                                "trimmed_mode": True}) == "on"
+    # 手动关优先级最高：就算以前裁剪过，也不再自动开
+    assert budget.takeover_mode({"takeover_manual": "off",
+                                "trimmed_mode": True}) == "off"
 
 
 # ---------------------------------------------------------------- extract
@@ -417,7 +450,7 @@ def test_fact_summaries_and_detail():
 # ---------------------------------------------------------------- inject
 
 def test_summary_builds_with_anchors_and_rolls():
-    """纪要：写盘、带边界、第二次只处理新裁掉的那一段。"""
+    """纪要：写盘、带日期、已总结的跳过，新内容只追加不覆盖。"""
     root = _tmp()
     try:
         store = summary_mod.SummaryStore(root)
@@ -435,28 +468,32 @@ def test_summary_builds_with_anchors_and_rolls():
             return "10-20 晚上：初次见面\n10-21：聊了工作"
 
         first = asyncio.run(summary_mod.build(
-            fake_llm, events, store, "s1", boundary_fp="f4",
-            chunk_chars=40, max_chars=500))
+            fake_llm, events, store, chunk_chars=40))
         assert first["ok"] and first["written"]
-        data = store.load("s1")
-        assert data["covered_fp"] == "f3", "边界之前的那条才是最后被纪要的"
+        data = store.load()
+        assert data["covered_fp"] == "f5", "第一次应该覆盖到当前最后一条"
         assert "初次见面" in data["text"]
         assert data["version"] == 1
         before_calls = len(calls)
 
+        # 没有新内容：跳过，不再调模型
+        same = asyncio.run(summary_mod.build(
+            fake_llm, events, store, chunk_chars=40))
+        assert same["skipped"] is True
+        assert len(calls) == before_calls
+
+        grown = events + [{
+            "fp": "f6", "ts": "2026-10-26T10:00:00+08:00",
+            "day": "2026-10-26", "role": "user", "origin": "x",
+            "session": "s1", "text": "第6条新消息", "tokens": 5}]
         second = asyncio.run(summary_mod.build(
-            fake_llm, events, store, "s1", boundary_fp="f5",
-            chunk_chars=40, max_chars=500))
+            fake_llm, grown, store, chunk_chars=40))
         assert second["ok"] and second["written"]
         assert len(calls) > before_calls, "新增了一段，必须再调一次"
-        assert store.load("s1")["version"] == 2
-        assert any("旧纪要" in c for c in calls[before_calls:]), \
-            "第二段要和旧纪要合并，不是直接追加"
-
-        same = asyncio.run(summary_mod.build(
-            fake_llm, events, store, "s1", boundary_fp="f5",
-            chunk_chars=40, max_chars=500))
-        assert same["skipped"] is True, "没有新内容就不该再调模型"
+        assert store.load()["version"] == 2
+        assert store.load()["covered_fp"] == "f6"
+        assert store.load()["text"].startswith(data["text"]), \
+            "旧纪要必须原样保留，只追加"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -476,15 +513,13 @@ def test_summary_cache_reuses_batches():
             return "10-22：聊了点事"
 
         store_a = summary_mod.SummaryStore(_tmp())
-        asyncio.run(summary_mod.build(fake_llm, events, store_a, "s1",
-                                      boundary_fp="", keep_recent=1,
+        asyncio.run(summary_mod.build(fake_llm, events, store_a,
                                       chunk_chars=30, cache=cache))
         assert len(calls) > 0
 
         store_b = summary_mod.SummaryStore(_tmp())
         calls.clear()
-        result = asyncio.run(summary_mod.build(fake_llm, events, store_b, "s1",
-                                               boundary_fp="", keep_recent=1,
+        result = asyncio.run(summary_mod.build(fake_llm, events, store_b,
                                                chunk_chars=30, cache=cache))
         assert result["ok"] and result["cached"] > 0
         assert calls == [], "内容没变就不该再调模型"
@@ -504,11 +539,19 @@ def test_summary_block_and_budget():
     plan = budget.decide(big, 0, 1000, Calibrator(enabled=False),
                          trigger_ratio=0.5, total_ratio=0.4,
                          facts_ratio=0.10, map_ratio=0.03,
-                         recall_ratio=0.05, summary_ratio=0.03)
+                         recall_ratio=0.05, summary_ratio=0.05)
     assert plan.applied
-    assert plan.budgets["summary"] == 30
-    assert plan.budgets["history"] == 400 - 100 - 30 - 50 - 30, \
-        "纪要的 3% 要从历史里扣，不能白加"
+    assert plan.budgets["summary"] == 50
+    assert plan.budgets["history"] == 400 - 100 - 30 - 50 - 50, \
+        "纪要的 5% 要从历史里扣，不能白加"
+
+
+def test_summary_block_prefers_latest():
+    """纪要只追加会越来越长；装不下时要保最近的，不是最旧的。"""
+    body = "\n".join(f"10-{i:02d}：第{i}件事" for i in range(1, 30))
+    block = inject.build_summary_block(body, budget=40)
+    assert "第29件事" in block
+    assert "第1件事" not in block
 
 
 def test_inject_blocks_and_marker():
@@ -865,6 +908,30 @@ def test_search_includes_unscoped_records():
         assert "s1" in fps
         assert "imp" in fps, "没有会话键的导入记录不该被过滤掉"
         assert "o1" not in fps, "别的会话不该串进来"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_search_many_or_query_and_two_char_fallback():
+    """多词走一条 OR/BM25；两字词 trigram 不命中时由 LIKE 兜底。"""
+    root = _tmp()
+    try:
+        index = Index(root)
+        index.add([
+            _ev("a", "2026-10-22T10:00:00+08:00", "她最近很怕黑"),
+            _ev("b", "2026-10-22T10:01:00+08:00", "今天搬家好累"),
+            _ev("c", "2026-10-22T10:02:00+08:00", "晚上一起吃饭"),
+        ])
+        hits = index.search_many(["怕黑", "搬家"], limit=10)
+        fps = [h["fp"] for h in hits]
+        assert "a" in fps and "b" in fps, fps
+        assert "c" not in fps, "不该被泛词带进来"
+        assert len(fps) == len(set(fps)), "多路结果要去重"
+
+        # 重新打开：词级 FTS 是 contentless，必须能自动回灌。
+        reopened = Index(root)
+        assert {h["fp"] for h in reopened.search_many(
+            ["怕黑"], limit=5)} == {"a"}
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1572,6 +1639,8 @@ def test_dedupe_and_budget():
     assert merged[0]["kind"] == "preference", \
         "合并时更具体的类型要盖过 fact，别被先到的那条吃掉"
     assert refine_mod.total_tokens(merged) > 0
+    assert extract.claim_similarity("用户喜欢猫", "用户喜欢狗") < \
+        extract.CLAIM_SIMILARITY, "只共用泛词的不同事实不能合并"
 
     long_claim = "这是一条很长的说法" * 20
     kept = refine_mod.dedupe_claims([{"claim": long_claim, "source_fp": ["d"]}])
@@ -1691,6 +1760,35 @@ def test_refine_keeps_old_facts_when_all_batches_fail():
 
         assert result["written"] == 0
         assert store.current_claims() == ["重要的旧事实"], "失败时必须保留旧事实"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_refine_keeps_old_facts_when_some_batches_fail():
+    """全量重炼只要有一批失败就不替换：宁可旧版完整，也不要残缺的新版。"""
+    root = _tmp()
+    try:
+        store = extract.FactStore(root)
+        store.upsert("重要的旧事实", ["old"])
+        calls = {"n": 0}
+
+        async def flaky_llm(prompt: str) -> str:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("第二批挂了")
+            return '[{"claim": "新事实", "sources": [1]}]'
+
+        events = [{"fp": f"s{i}", "role": "user", "text": "字" * 60}
+                  for i in range(4)]
+        result = asyncio.run(refine_mod.run(
+            flaky_llm, events, store, target_tokens=2000,
+            chunk_chars=120, max_facts=5, replace=True))
+
+        assert result["written"] == 0
+        assert result["failed_batches"] >= 1
+        assert result["error"]
+        assert store.current_claims() == ["重要的旧事实"], \
+            "部分批次失败时也不能替换"
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -2202,11 +2300,11 @@ def test_backfill_images_from_astrbot_db():
 # ---------------------------------------------------------------- 检索
 
 def test_split_terms_for_chinese_sentences():
-    """整句当关键词是查不到的：要拆出短词，长的再切三字窗口。"""
+    """整句当关键词是查不到的：要拆出短词和 n-gram。"""
     terms = query_mod.split_terms("我今天好累啊，你说我该不该辞职")
-    assert "好累" not in terms, "两字太泛，不该单独出"
+    assert "好累" in terms, "两字词走词级 FTS，不能丢"
     assert any(len(t) == 3 for t in terms), "长句必须切出三字窗口"
-    assert "我今天好累啊" in terms, "整段仍然保留，精确匹配时有用"
+    assert "我今天好累啊" not in terms, "过长的整句不该当 phrase"
 
     short = query_mod.split_terms("考研")
     assert short == ["考研"]
@@ -2364,6 +2462,684 @@ def test_infer_sender_for_history():
     assert sync.infer_sender(group) == "", "群聊推不出是谁"
     assert sync.infer_sender("webchat:session:abc") == "", "认不出的格式就留空"
     assert sync.infer_sender("") == ""
+
+
+# ---------------------------------------------------------------- 按 id 隔离
+
+def test_ids_safe_component_and_stable_mapping():
+    """文件夹名优先 ID，其次账户名，最后会话名；同一 session 永远稳定。"""
+    assert ids_mod.safe_component('a:b*c?') == "a_b_c_"
+    assert ids_mod.safe_component("CON") == "_CON"
+    assert ids_mod.safe_component("  ") == "unknown"
+    assert ids_mod.is_private_session("aiocqhttp:GroupMessage:1") is False
+    assert ids_mod.is_private_session("aiocqhttp:FriendMessage:1") is True
+    assert ids_mod.is_private_session("webchat:session:x") is True
+
+    root = _tmp()
+    try:
+        ids = ids_mod.SessionIds(root)
+        assert ids.resolve("s1", "123456", "小明") == "123456"
+        assert ids.resolve("s1") == "123456", "第二次必须命中映射，不能再按名称变"
+        assert ids.resolve("s2", "", "小红") == "小红"
+        assert ids.resolve("s3") == "s3"
+        assert ids.id_for("s1") == "123456"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_vault_and_index_isolate_same_text_by_id():
+    """同一句话在两个 id 里是两条记录，不能互相覆盖。"""
+    root = _tmp()
+    try:
+        vault = Vault(root)
+        index = Index(root)
+        text = "我今天好累"
+        ts = "2026-10-22T10:00:00+08:00"
+        a = _ev("same", ts, text, session="s1")
+        b = _ev("same", ts, text, session="s2")
+        a["uid"] = "u1"
+        b["uid"] = "u2"
+
+        vault.append([a, b])
+        assert vault.ids() == ["u1", "u2"]
+        assert len(vault.read_day("2026-10-22", "u1")) == 1
+        assert len(vault.read_day("2026-10-22", "u2")) == 1
+
+        assert index.add([a, b]) == 2
+        assert index.has("same", "u1") and index.has("same", "u2")
+        assert index.count("u1") == 1 and index.count("u2") == 1
+        hits = index.search(text, uid="u1")
+        assert hits and all(hit["uid"] == "u1" for hit in hits)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_fact_summary_media_state_are_per_id():
+    root = _tmp()
+    try:
+        fa = extract.FactStore(root, "a")
+        fb = extract.FactStore(root, "b")
+        fa.upsert("A 的猫", ["f1"])
+        fb.upsert("B 的狗", ["f2"])
+        assert [f["claim"] for f in extract.summaries(fa)] == ["A 的猫"]
+        assert [f["claim"] for f in extract.summaries(fb)] == ["B 的狗"]
+
+        sa = summary_mod.SummaryStore(root, "a")
+        sb = summary_mod.SummaryStore(root, "b")
+        sa.save({"text": "A 的纪要"})
+        sb.save({"text": "B 的纪要"})
+        assert sa.load()["text"] == "A 的纪要"
+        assert sb.load()["text"] == "B 的纪要"
+
+        ma = media_mod.MediaStore(root, "a")
+        mb = media_mod.MediaStore(root, "b")
+        ma.append_record("f1", "s1", [{"kind": "image", "hash": "h1",
+                                       "path": "blobs/h1.jpg", "size": 1}])
+        assert ma.records_for({"f1"})
+        assert mb.records_for({"f1"}) == {}
+
+        states = budget.StateStore(root)
+        states.save("a", {"trim_count": 1})
+        states.save("b", {"trim_count": 2})
+        assert states.load("a")["trim_count"] == 1
+        assert states.load("b")["trim_count"] == 2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_refine_append_only_processes_cursor():
+    """增量提炼只处理游标之后的新历史；游标之外不重复调模型。"""
+    root = _tmp()
+    try:
+        store = extract.FactStore(root)
+        cache = refine_mod.ExtractionCache(root)
+        events = [{"fp": f"f{i}", "role": "user", "text": f"第{i}条：" + "字" * 30}
+                  for i in range(4)]
+        calls = []
+
+        async def fake_llm(prompt: str) -> str:
+            calls.append(prompt)
+            return '[{"claim": "一条长期事实", "sources": [1]}]'
+
+        first = asyncio.run(refine_mod.run(
+            fake_llm, events, store, target_tokens=2000,
+            chunk_chars=200, max_facts=5, replace=False, cursor="", cache=cache))
+        assert first["written"] >= 1
+        assert first["covered_fp"] == "f3"
+
+        same = asyncio.run(refine_mod.run(
+            fake_llm, events, store, target_tokens=2000,
+            chunk_chars=200, max_facts=5, replace=False,
+            cursor=first["covered_fp"], cache=cache))
+        assert same["skipped"] is True
+
+        grown = events + [{"fp": "f4", "role": "user",
+                           "text": "第4条：" + "新" * 30}]
+        third = asyncio.run(refine_mod.run(
+            fake_llm, grown, store, target_tokens=2000,
+            chunk_chars=200, max_facts=5, replace=False,
+            cursor=first["covered_fp"], cache=cache))
+        assert third["written"] >= 1
+        assert third["covered_fp"] == "f4"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_facts_block_prefers_latest_when_over_budget():
+    facts = [
+        {"claim": "很旧的" + "旧" * 30, "extracted_at": "2026-01-01T00:00:00"},
+        {"claim": "最新的" + "新" * 30, "extracted_at": "2026-10-24T00:00:00"},
+    ]
+    block = inject.build_facts_block(facts, budget=45)
+    assert "最新" in block
+    assert "很旧" not in block, "装不下时取最近，不是按原顺序取最旧"
+
+
+def test_usage_input_tokens_supports_astrbot_token_usage():
+    """AstrBot 的 TokenUsage 没有 prompt_tokens，只有 input/input_other。"""
+    class Usage:
+        input_other = 100
+        input_cached = 20
+        output = 50
+        input = 120
+
+    assert tokens_mod.usage_input_tokens(Usage()) == 120
+    assert tokens_mod.usage_input_tokens(
+        {"input_other": 90, "input_cached": 10, "output": 5}) == 100
+    assert tokens_mod.usage_input_tokens({"prompt_tokens": 77}) == 77
+    assert tokens_mod.usage_input_tokens(None) == 0
+
+
+def test_entity_store_add_expand_and_suggest():
+    root = _tmp()
+    try:
+        store = EntityStore(root, "u1")
+        store.add("小木", ["木木", "大肥鱼小木"], kind="person")
+        assert [x["canonical"] for x in store.all()] == ["小木"]
+        expanded = store.expand("木木今天在吗")
+        assert "小木" in expanded and "木木" in expanded
+        assert store.expand("他在吗") == [], "代词不能自动扩成实体"
+        assert store.remove("小木") is True
+        assert store.all() == []
+
+        suggested = EntityStore.suggest([
+            {"claim": "主人叫千羽落花"},
+            {"claim": "小木的名字是主人取的"},
+        ])
+        assert "千羽落花" in suggested
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_mmr_dedupes_near_duplicates():
+    items = [
+        {"fp": "a", "text": "我们今天去海边看了很久的日落和潮水", "score": 1.0},
+        {"fp": "b", "text": "我们今天去海边看了很久的日落和潮水", "score": 0.99},
+        {"fp": "c", "text": "今天家里煮了一锅白米饭", "score": 0.8},
+    ]
+    out = search_mod.mmr(items, limit=2, lambda_=0.5)
+    assert len(out) == 2
+    assert out[0]["fp"] == "a"
+    assert out[1]["fp"] == "c", "重复的 b 应该被多样性惩罚挤掉"
+
+
+def test_synonym_store_expands_and_persists():
+    root = _tmp()
+    try:
+        store = SynonymStore(root, "u1")
+        assert "疲惫" in store.expand("今天好累")
+        added = store.add("怕黑", ["怕暗", "不敢关灯"])
+        assert added["canonical"] == "怕黑"
+        reopened = SynonymStore(root, "u1")
+        values = reopened.expand("我不敢关灯")
+        assert "怕黑" in values and "怕暗" in values
+        assert reopened.remove("怕黑") is True
+        assert reopened.expand("蓝色海豚") == []
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_select_facts_keeps_core_before_events():
+    facts = [
+        {"id": "core", "claim": "小木的名字是主人取的", "kind": "identity"},
+        {"id": "event", "claim": "今天去了海边看日落", "kind": "event"},
+    ]
+    selected = inject.select_facts(facts, budget=20)
+    ids = [item["id"] for item in selected]
+    assert "core" in ids
+    assert "event" not in ids, "核心事实优先，预算不够时先牺牲事件"
+
+
+# ---------------------------------------------------------------- summary / facts 修复
+
+def test_summary_clean_text_removes_placeholders_and_sorts():
+    assert summary_mod.is_placeholder("（无值得记录的内容）")
+    raw = "\n".join([
+        "10-24 21:00：晚上聊了相机",
+        "（空内容）",
+        "10-24 20:00：下午聊了游戏",
+        "10-24 21:00：晚上聊了相机",
+        "10-24 21:00：对方说晚上聊了相机",
+        "（无）",
+        "（无值得记录的内容）",
+    ])
+    out = summary_mod.clean_text(raw)
+    lines = out.splitlines()
+    assert all(not summary_mod.is_placeholder(line) for line in lines)
+    assert lines[0].startswith("10-24 20:00")
+    assert len(lines) == 2, "同一时刻的近义句应合并"
+    assert summary_mod._line_key("10-24 晚：x") < summary_mod._line_key("10-25 00:00：x")
+
+
+def test_summary_repair_and_covered_index():
+    root = _tmp()
+    try:
+        store = summary_mod.SummaryStore(root, "u1")
+        store.save({
+            "uid": "u1",
+            "text": "10-24 21:00：A\n（空）\n10-24 20:00：B",
+            "chars": 0,
+        })
+        info = store.repair()
+        assert info["ok"] is True
+        loaded = store.load()
+        assert "（空）" not in loaded["text"]
+        assert loaded["text"].splitlines()[0].startswith("10-24 20:00")
+
+        events = [
+            {"fp": "a", "ts": "2026-10-24T20:00:00+08:00",
+             "role": "user", "text": "A"},
+            {"fp": "b", "ts": "2026-10-24T20:01:00+08:00",
+             "role": "assistant", "text": "B"},
+        ]
+
+        async def fake_llm(prompt: str) -> str:
+            return "10-24 20:00：测试事件"
+
+        first = asyncio.run(summary_mod.build(fake_llm, events, store, uid="u1"))
+        assert first["written"] is True
+        assert store.load()["covered_index"] == len(events)
+        second = asyncio.run(summary_mod.build(fake_llm, events, store, uid="u1"))
+        assert second["skipped"] is True, "条数游标已覆盖，不能重复总结"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_factstore_fuzzy_merge_and_repair():
+    root = _tmp()
+    try:
+        store = extract.FactStore(root, "u1")
+        first = store.upsert("用户停用自动配图插件，仅加标签时临时开启",
+                             ["a"], kind="fact")
+        second = store.upsert("用户停用自动配图插件，仅需要时开启加标签",
+                              ["b"], kind="fact")
+        assert first == second
+        assert len(store.latest()) == 1
+        assert set(store.latest()[first]["source_fp"]) == {"a", "b"}
+
+        # 模拟两条已经存在的重复文件，repair 应合并并标记 deleted。
+        store._write({
+            "id": "dup-1", "scope": "people", "deleted": False,
+            "versions": [{"version": 1,
+                          "claim": "AstrBot原生不解析QQ里的B站分享卡片",
+                          "kind": "fact", "source_fp": ["c"],
+                          "extracted_at": "2026-10-25T00:00:00+08:00"}],
+        })
+        store._write({
+            "id": "dup-2", "scope": "people", "deleted": False,
+            "versions": [{"version": 1,
+                          "claim": "用户的AstrBot/NapCat默认解析不了B站分享卡片，需插件补足",
+                          "kind": "fact", "source_fp": ["d"],
+                          "extracted_at": "2026-10-25T00:01:00+08:00"}],
+        })
+        info = store.repair()
+        assert info["merged"] >= 1
+        assert store.load("dup-2").get("deleted") is True
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_refine_fact_provenance_has_prompt_version():
+    root = _tmp()
+    try:
+        store = extract.FactStore(root, "u1")
+
+        async def fake_llm(prompt: str) -> str:
+            return ('[{"claim": "用户喜欢相机", "kind": "preference",'
+                    ' "sources": [1]}]')
+
+        events = [{"fp": "s1", "role": "user", "text": "我喜欢相机"}]
+        result = asyncio.run(refine_mod.run(
+            fake_llm, events, store, target_tokens=2000,
+            model="deepseek-test", prompt_version="v9"))
+        assert result["written"] == 1
+        fact = next(iter(store.all_facts()))
+        version = fact["versions"][-1]
+        assert version["model"] == "deepseek-test"
+        assert version["prompt_version"] == "v9"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- 检索修复
+
+def test_query_yes_no_and_topic_terms():
+    assert query_mod.is_yes_no("小木喜欢喝咖啡吗？")
+    assert not query_mod.is_yes_no("小木喜欢喝咖啡")
+    assert query_mod.topic_terms("小木喜欢喝咖啡吗？") == ["咖啡"]
+    assert "猫" in query_mod.topic_terms("小木养过猫吗？")
+
+
+def test_index_get_many():
+    root = _tmp()
+    try:
+        vault = Vault(root)
+        index = Index(root)
+        events = [
+            _ev("a", "2026-10-20T21:00:00+08:00", "第一句"),
+            _ev("b", "2026-10-20T21:01:00+08:00", "第二句"),
+        ]
+        for event in events:
+            event["uid"] = "u1"
+        vault.append(events)
+        index.add(events)
+        got = index.get_many(["a", "b", "missing"], "u1")
+        assert set(got) == {"a", "b"}
+        assert got["a"]["text"] == "第一句"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_combine_uses_batch_fetch():
+    literal = [[{"fp": "a", "ts": "2026-10-20T21:00:00+08:00",
+                 "role": "user", "text": "A"}]]
+    calls = []
+
+    def fetch_many(fps):
+        calls.append(list(fps))
+        return {"b": {"ts": "2026-10-20T21:01:00+08:00",
+                      "role": "assistant", "text": "B"}}
+
+    out = search_mod.combine(literal, [("b", 0.9)], fetch_many=fetch_many,
+                             limit=5)
+    assert calls == [["b"]]
+    assert any(item["fp"] == "b" and item["text"] == "B" for item in out)
+
+
+def test_pipeline_negative_topic_filter():
+    root = _tmp()
+    try:
+        vault = Vault(root)
+        index = Index(root)
+        events = [
+            _ev("t1", "2026-10-20T21:00:00+08:00", "小木喜欢喝茶"),
+            _ev("t2", "2026-10-20T21:01:00+08:00", "小木养过鱼"),
+        ]
+        for event in events:
+            event["uid"] = "u1"
+        vault.append(events)
+        index.add(events)
+
+        coffee = pipeline.retrieve(index, "喜欢喝咖啡吗", uid="u1", limit=5,
+                                   use_vector=False, use_mmr=False, boost=False)
+        assert coffee == [], "没有咖啡证据时不能返回命中"
+        tea = pipeline.retrieve(index, "喜欢喝茶吗", uid="u1", limit=5,
+                                use_vector=False, use_mmr=False, boost=False)
+        assert any(hit["fp"] == "t1" for hit in tea)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_pipeline_date_mode_prefers_day():
+    root = _tmp()
+    try:
+        vault = Vault(root)
+        index = Index(root)
+        events = [
+            _ev("d1", "2026-10-22T00:24:00+08:00",
+                "日记采用 md 格式，一次 200-300 字"),
+            _ev("d2", "2026-10-23T21:00:00+08:00",
+                "今天聊的是别的事情"),
+        ]
+        for event in events:
+            event["uid"] = "u1"
+        vault.append(events)
+        index.add(events)
+
+        hits = pipeline.retrieve(index, "10月22号写日记的要求", uid="u1",
+                                 limit=5, use_vector=False, use_mmr=True,
+                                 boost=True)
+        assert hits
+        assert hits[0]["fp"] == "d1"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- manifest / M 读取
+
+def _write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
+def _seed_memory(base: str) -> str:
+    """造一个最小的 all_memory：vault / facts / summary / persona / media。"""
+    root = os.path.join(base, "all_memory")
+    first = {
+        "fp": "aaa", "uid": "123", "ts": "2026-10-24T21:00:00+08:00",
+        "day": "2026-10-24", "role": "user", "text": "今天买了 A7M4 相机",
+        "tokens": 8,
+    }
+    second = {
+        "fp": "bbb", "uid": "123", "ts": "2026-10-24T21:01:00+08:00",
+        "day": "2026-10-24", "role": "assistant", "text": "恭喜",
+        "tokens": 2,
+    }
+    _write_text(
+        os.path.join(root, "vault", "123", "2026-10-24.jsonl"),
+        "\n".join(json.dumps(x, ensure_ascii=False) for x in (first, second)) + "\n")
+    _write_text(
+        os.path.join(root, "facts", "123", "fact-1.json"),
+        json.dumps({
+            "id": "fact-1",
+            "versions": [{
+                "version": 1, "claim": "用户买了 A7M4", "kind": "fact",
+                "source_fp": ["aaa"], "extracted_at": "2026-10-24T21:02:00+08:00",
+            }],
+        }, ensure_ascii=False))
+    _write_text(
+        os.path.join(root, "summaries", "123", "summary.json"),
+        json.dumps({
+            "text": "10-24：买了相机", "covered_fp": "bbb",
+            "covered_until": "2026-10-24T21:01:00+08:00",
+        }, ensure_ascii=False))
+    _write_text(os.path.join(root, "personas", "abc.txt"), "人格")
+    _write_text(
+        os.path.join(root, "media", "123", "2026-10-24.jsonl"),
+        json.dumps({
+            "fu": "aaa", "ts": "2026-10-24T21:00:00+08:00",
+            "items": [{
+                "kind": "image", "hash": "deadbeef",
+                "path": "blobs/de/ad/deadbeef.jpg", "size": 3,
+                "name": "x.jpg", "mime": "image/jpeg",
+            }],
+        }, ensure_ascii=False) + "\n")
+    _write_text(os.path.join(root, "blobs", "de", "ad", "deadbeef.jpg"), "abc")
+    _write_text(os.path.join(root, "entities", "123.json"),
+                json.dumps({"entities": []}, ensure_ascii=False))
+    _write_text(os.path.join(root, "synonyms", "123.json"),
+                json.dumps({"groups": []}, ensure_ascii=False))
+    _write_text(os.path.join(root, "state", "_sessions.json"),
+                json.dumps({"s": "123"}))
+    _write_text(os.path.join(root, "state", "123", "state.json"), "{}")
+    _write_text(os.path.join(root, "index.db"), "not a db")
+    _write_text(os.path.join(root, "vectors.db"), "not a db")
+    _write_text(os.path.join(root, "cache", "x.txt"), "x")
+    return root
+
+
+def test_manifest_roundtrip_and_corruption():
+    base = _tmp()
+    try:
+        root = _seed_memory(base)
+        data = manifest_mod.write(
+            root, plugin_version="test",
+            models={"embedding": "local-hash-v1"},
+            prompt_versions={"extract": "v2", "summary": "v2"})
+        assert data["schema"] == manifest_mod.SCHEMA
+        assert data["counts"]["events"] == 2
+        assert data["counts"]["facts"] == 1
+        assert data["counts"]["blobs"] == 1
+        assert os.path.isfile(os.path.join(root, manifest_mod.MANIFEST_NAME))
+        assert os.path.isfile(os.path.join(root, manifest_mod.README_NAME))
+
+        result = manifest_mod.verify(root)
+        assert result["ok"], result["errors"][:3]
+
+        os.remove(os.path.join(root, "blobs", "de", "ad", "deadbeef.jpg"))
+        bad = manifest_mod.verify(root)
+        assert not bad["ok"]
+        assert any("缺少文件" in item or "deadbeef" in item
+                   for item in bad["errors"])
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_manifest_detects_orphan_fact_and_zip_roundtrip():
+    base = _tmp()
+    try:
+        root = _seed_memory(base)
+        _write_text(
+            os.path.join(root, "facts", "123", "fact-2.json"),
+            json.dumps({
+                "id": "fact-2",
+                "versions": [{
+                    "version": 1, "claim": "出处不存在", "kind": "fact",
+                    "source_fp": ["zzz"],
+                }],
+            }, ensure_ascii=False))
+        manifest_mod.write(root)
+        bad = manifest_mod.verify(root)
+        assert not bad["ok"]
+        assert any("出处不存在" in item for item in bad["errors"])
+
+        os.remove(os.path.join(root, "facts", "123", "fact-2.json"))
+        manifest_mod.write(root)
+
+        import zipfile
+        zip_path = os.path.join(base, "out.zip")
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    if name in (manifest_mod.MANIFEST_NAME,
+                                manifest_mod.README_NAME):
+                        continue
+                    full = os.path.join(dirpath, name)
+                    rel = os.path.relpath(full, root).replace(os.sep, "/")
+                    archive.write(full, "all_memory/" + rel)
+            archive.writestr("astrbot_data/host.txt", "not memory")
+
+        attached = manifest_mod.attach_to_zip(zip_path, plugin_version="test")
+        assert attached["counts"]["events"] == 2
+        result = manifest_mod.verify_zip(zip_path)
+        assert result["ok"], result["errors"][:3]
+        assert result["counts"]["facts"] == 1
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_manifest_rejects_unsafe_path():
+    base = _tmp()
+    try:
+        root = _seed_memory(base)
+        manifest_mod.write(root)
+        path = os.path.join(root, manifest_mod.MANIFEST_NAME)
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["files"].append({"path": "../evil.txt", "size": 1, "sha256": ""})
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+        result = manifest_mod.verify(root)
+        assert not result["ok"]
+        assert any("非法路径" in item for item in result["errors"])
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_manifest_live_derived_removal_is_warning():
+    base = _tmp()
+    try:
+        root = _seed_memory(base)
+        manifest_mod.write(root)
+        os.remove(os.path.join(root, "facts", "123", "fact-1.json"))
+
+        live = manifest_mod.verify(root, strict=False)
+        assert live["ok"], live["errors"][:3]
+        assert any("缺少文件" in item and "派生" in item
+                   for item in live["warnings"])
+
+        snapshot = manifest_mod.verify(root, strict=True)
+        assert not snapshot["ok"]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_manifest_live_file_update_is_warning():
+    base = _tmp()
+    try:
+        root = _seed_memory(base)
+        manifest_mod.write(root)
+        path = os.path.join(root, "facts", "123", "fact-1.json")
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["versions"][0]["claim"] = "用户买了新相机"
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+
+        live = manifest_mod.verify(root, strict=False)
+        assert live["ok"], live["errors"][:3]
+        assert any("sha256 不符" in item for item in live["warnings"])
+
+        snapshot = manifest_mod.verify(root, strict=True)
+        assert not snapshot["ok"]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_manifest_live_growth_is_warning_not_error():
+    base = _tmp()
+    try:
+        root = _seed_memory(base)
+        manifest_mod.write(root)
+        extra = {
+            "fp": "ccc", "uid": "123", "ts": "2026-10-25T10:00:00+08:00",
+            "day": "2026-10-25", "role": "user", "text": "新的一天",
+        }
+        with open(os.path.join(root, "vault", "123", "2026-10-25.jsonl"),
+                  "a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(extra, ensure_ascii=False) + "\n")
+
+        live = manifest_mod.verify(root, strict=False)
+        assert live["ok"], live["errors"][:3]
+        assert live["warning_count"] > 0
+        assert any("manifest 落后" in item for item in live["warnings"])
+
+        snapshot = manifest_mod.verify(root, strict=True)
+        assert not snapshot["ok"]
+        assert any("counts.events" in item for item in snapshot["errors"])
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_export_replaces_stale_manifest():
+    base = _tmp()
+    try:
+        import zipfile
+        root = _seed_memory(base)
+        manifest_mod.write(root, plugin_version="old")
+        zip_path = os.path.join(base, "export.zip")
+        info = backup.build_zip(zip_path, [(root, "all_memory", ())])
+        assert info["skipped"] >= 2, "旧 manifest/README 不应被原样打进去"
+        with zipfile.ZipFile(zip_path) as archive:
+            names = set(archive.namelist())
+        assert "all_memory/manifest.json" not in names
+        assert "all_memory/README_M.md" not in names
+
+        attached = manifest_mod.attach_to_zip(zip_path, plugin_version="new")
+        assert attached["plugin_version"] == "new"
+        with zipfile.ZipFile(zip_path) as archive:
+            assert "all_memory/manifest.json" in archive.namelist()
+            assert "all_memory/README_M.md" in archive.namelist()
+        assert manifest_mod.verify_zip(zip_path)["ok"]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_m_read_stats_search_day_fact():
+    base = _tmp()
+    try:
+        root = _seed_memory(base)
+        manifest_mod.write(root)
+
+        data = m_read.stats(root)
+        assert data["counts"]["events"] == 2
+        assert data["counts"]["facts"] == 1
+        assert data["manifest"] is True
+
+        hits = m_read.search(root, "A7M4")
+        assert len(hits) == 1
+        assert hits[0]["fp"] == "aaa"
+
+        items = m_read.day(root, "2026-10-24")
+        assert len(items) == 2
+
+        found = m_read.fact(root, "fact-1")
+        assert found is not None
+        assert found["sources"][0]["found"] is True
+        assert "A7M4" in found["sources"][0]["event"]["text"]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- 入口

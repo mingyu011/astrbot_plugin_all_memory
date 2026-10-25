@@ -43,13 +43,15 @@ class _Emitter:
     """
 
     def __init__(self, vault, index, origin: str, session: str = "",
-                 dry_run: bool = False, backfill: bool = False):
+                 dry_run: bool = False, backfill: bool = False,
+                 uid: str = "default"):
         self.vault = vault
         self.index = index
         self.origin = origin
         self.session = session
         self.dry_run = bool(dry_run)
         self.backfill = bool(backfill)
+        self.uid = uid
         self.fps: list[str] = []
 
     def __call__(self, role: str, text, ts=None, backfill=None) -> bool:
@@ -63,15 +65,15 @@ class _Emitter:
             backfill = self.backfill
         return sync_message(self.vault, self.index, role, text,
                             session=self.session, origin=self.origin,
-                            ts=ts, backfill=backfill)
+                            ts=ts, backfill=backfill, uid=self.uid)
 
 
-def missing_fps(index, fps: list[str]) -> int:
+def missing_fps(index, fps: list[str], uid: str | None = None) -> int:
     """候选指纹里还有多少条不在索引里（= 还没进库）。"""
     unique = list(dict.fromkeys(fps or []))
     if not unique:
         return 0
-    return len(unique) - len(index.has_many(unique))
+    return len(unique) - len(index.has_many(unique, uid))
 
 
 def expand_messages(text: str) -> list[tuple[str, str]]:
@@ -145,7 +147,7 @@ def scan_sqlite(db_path: str) -> list[dict]:
 
 
 def import_astrbot(db_path: str, vault, index, session: str = "",
-                   dry_run: bool = False) -> dict:
+                   dry_run: bool = False, uid: str = "default") -> dict:
     """
     只读模式打开 AstrBot 的 SQLite，把能认出来的文本全部收进原始层。
     认不出结构的表会被跳过并记下来，不猜、不写。
@@ -160,7 +162,7 @@ def import_astrbot(db_path: str, vault, index, session: str = "",
         return stats
 
     emit = _Emitter(vault, index, "import_astrbot",
-                    session=session, dry_run=dry_run)
+                    session=session, dry_run=dry_run, uid=uid)
 
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
@@ -247,7 +249,8 @@ def import_astrbot(db_path: str, vault, index, session: str = "",
 
 # ================================================================ memory_beyond 目录
 
-def import_beyond(root: str, vault, index, dry_run: bool = False) -> dict:
+def import_beyond(root: str, vault, index, dry_run: bool = False,
+                  uid: str = "default") -> dict:
     """
     读 memory_beyond 的数据目录：
         state/*.json          压缩摘要与水位线
@@ -266,7 +269,7 @@ def import_beyond(root: str, vault, index, dry_run: bool = False) -> dict:
     # memory_beyond 的文件里没有可用的消息时间，落库时间就是「归档时刻」，
     # 所以统一标 backfill，面板上如实显示「回填」而不是假装当时发生。
     emit = _Emitter(vault, index, "import_beyond", dry_run=dry_run,
-                    backfill=True)
+                    backfill=True, uid=uid)
 
     for dirpath, _dirnames, filenames in os.walk(root):
         for name in filenames:
@@ -391,45 +394,47 @@ def _decode_image_uri(url: str) -> tuple[bytes, str, str]:
 
 
 def _media_keys(media_dir: str) -> set:
-    """已有附件记录的键（fu|hash 排序），用来去重。"""
+    """已有附件记录的键（fu|hash 排序），用来去重。递归扫 id 子目录。"""
     from .media import base_fp
 
     keys = set()
     if not os.path.isdir(media_dir):
         return keys
-    for name in os.listdir(media_dir):
-        if not name.endswith(".jsonl"):
-            continue
-        try:
-            with open(os.path.join(media_dir, name), "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    fu = base_fp(str(row.get("fu") or ""))
-                    hashes = sorted(str(i.get("hash", "")) for i in (row.get("items") or []))
-                    if fu:
-                        keys.add(f"{fu}|{','.join(hashes)}")
-        except OSError:
-            continue
+    for _dirpath, _dirnames, filenames in os.walk(media_dir):
+        for name in filenames:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                with open(os.path.join(_dirpath, name), "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        fu = base_fp(str(row.get("fu") or ""))
+                        hashes = sorted(str(i.get("hash", "")) for i in (row.get("items") or []))
+                        if fu:
+                            keys.add(f"{fu}|{','.join(hashes)}")
+            except OSError:
+                continue
     return keys
 
 
 def backfill_media_from_astrbot(db_path: str, media_store,
-                                dry_run: bool = False) -> dict:
+                                dry_run: bool = False, ids=None) -> dict:
     """
-    把宿主库里内嵌的图片（data URI）解出来，补进 blobs/ 和 media/。
+    把宿主库里内嵌的图片（data URI）解出来，补进 blobs/ 和 media/<id>/。
 
     用途：插件晚装、或附件归档有 bug 时，把历史图片补回来。
     AstrBot 的 conversations.content 里图片是 base64 内嵌的，所以补得回来。
 
+    ids：SessionIds；给了就按每个会话解析 id，分别写进各自的 media 文件夹。
     只读宿主库，绝不改它。
     """
-    from .media import base_fp, save_blob
+    from .media import MediaStore, base_fp, save_blob
     from .sync import parse_reminder_time
     from .vault import fp_of
 
@@ -439,8 +444,7 @@ def backfill_media_from_astrbot(db_path: str, media_store,
         stats["errors"].append(f"文件不存在: {db_path}")
         return stats
 
-    media_dir = os.path.join(media_store.root, "media")
-    known = _media_keys(media_dir)
+    known_cache: dict[str, set] = {}
 
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
@@ -453,6 +457,15 @@ def backfill_media_from_astrbot(db_path: str, media_store,
             "SELECT user_id, content, updated_at FROM conversations").fetchall()
         for user_id, content, updated_at in rows:
             stats["conversations"] += 1
+            scope = (ids.resolve(str(user_id or "")) if ids is not None
+                     else getattr(media_store, "uid", "default"))
+            store = (media_store if scope == getattr(media_store, "uid", "default")
+                     else MediaStore(media_store.root, scope))
+            if scope not in known_cache:
+                known_cache[scope] = _media_keys(
+                    os.path.join(media_store.root, "media", scope))
+            known = known_cache[scope]
+
             try:
                 messages = json.loads(content) if isinstance(content, str) else content
             except (json.JSONDecodeError, ValueError):
@@ -498,7 +511,7 @@ def backfill_media_from_astrbot(db_path: str, media_store,
                         stats["bytes"] += len(data)
                         continue
                     _digest, rel = save_blob(media_store.root, data, ext)
-                    media_store.append_record(
+                    store.append_record(
                         fp or digest, user_id or "",
                         [{"kind": "image", "hash": digest, "path": rel,
                           "size": len(data), "name": f"{digest[:8]}{ext}",

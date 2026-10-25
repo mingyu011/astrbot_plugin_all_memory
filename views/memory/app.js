@@ -10,6 +10,7 @@ const state = {
   kind: "all",
   filter: "",
   session: null,
+  uid: "",
   total: 0,
   loading: false,
   // 左侧列表的模式：sessions（会话记录）/ facts（人物卡）
@@ -19,6 +20,8 @@ const state = {
   facts: [],
   factFilter: "",
   fact: null,
+  // 全局接管状态：auto / on / off（对所有会话生效）
+  takeover: "auto",
   // 右侧历史面板顶部的纪要是否展开
   summaryOpen: false,
   // 是否贴在最底部：打开会话默认贴底，像 QQ 一样直接看到最新一条。
@@ -197,6 +200,7 @@ function syncSelectionUI(items) {
 
 function selectSession(item) {
   state.session = item.session;
+  state.uid = item.uid || "";
   state.total = item.count;
   state.stickBottom = true;
   $("history-list").replaceChildren();
@@ -207,6 +211,84 @@ function selectSession(item) {
   renderUsage(item);
   renderSessions();
   loadHistory();
+}
+
+// ---------------------------------------------------------------- 接管开关
+
+function renderTakeover(data) {
+  const btn = $("btn-takeover");
+  if (!btn) return;
+  const mode = (data && data.mode) || "auto";
+  const windowSize = Number(data && data.window);
+  state.takeover = mode;
+  btn.hidden = false;
+  btn.classList.toggle("on", mode !== "off" && windowSize > 0);
+  btn.classList.toggle("warn", mode !== "off" && !(windowSize > 0));
+
+  if (mode === "off") {
+    btn.textContent = "全局接管：关";
+    btn.title = "所有会话都不再裁剪、不再注入，交回 AstrBot 原生上下文。点击全局开启。";
+    return;
+  }
+  if (mode === "on") {
+    btn.textContent = data && data.manual ? "全局接管：开" : "全局接管：开（自动）";
+    btn.title = "所有会话每轮注入纪要/事实/地图/检索。点击全局关闭。";
+  } else {
+    btn.textContent = "全局接管：关（自动）";
+    btn.title = "默认关；任意会话第一次裁剪时自动开启，之后所有会话都注入。点一下立即开启。";
+  }
+  if (!(windowSize > 0)) {
+    btn.textContent = "全局接管：未生效";
+    btn.title = "还没填上下文窗口，接管不会注入；先去设置页填窗口。";
+  }
+}
+
+async function loadTakeover() {
+  try {
+    const data = unwrap(await apiGet("takeover"));
+    renderTakeover(data);
+  } catch (err) {
+    // 老宿主没有这个接口时不显示按钮，不影响其它功能
+    $("btn-takeover").hidden = true;
+  }
+}
+
+async function setTakeover(on) {
+  const btn = $("btn-takeover");
+  btn.disabled = true;
+  try {
+    let data;
+    try {
+      // 用字符串而不是布尔：有些 bridge 会把 falsy 参数吞掉
+      data = unwrap(await apiPost("takeover", { on: on ? "on" : "off" }));
+    } catch (postErr) {
+      // 有些版本的 bridge 只给 GET
+      data = unwrap(await apiGet("takeover", { on: on ? "1" : "0" }));
+    }
+    renderTakeover(data);
+    toast(on ? "已开启全局接管：所有会话（含新会话）都会注入记忆\n"
+                + "人物卡按人跨会话；纪要仍按当前会话"
+             : "已关闭全局接管：所有会话回到官方上下文");
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function toggleTakeover() {
+  const mode = state.takeover || "auto";
+  if (mode === "off" || mode === "auto") {
+    await setTakeover(true);
+    return;
+  }
+  if (!window.confirm(
+    "关闭全局接管？\n\n" +
+    "关闭后所有会话都不再裁剪、不再注入记忆块，交回 AstrBot 原生上下文管理。\n" +
+    "已经被裁掉的历史不会自动回来；如果宿主内置压缩也关了，长对话可能撞模型上限。")) {
+    return;
+  }
+  await setTakeover(false);
 }
 
 // ---------------------------------------------------------------- 前情纪要
@@ -243,8 +325,8 @@ function renderSummary(data) {
   if (!data || !data.exists) {
     $("summary-meta").textContent = "前情纪要：还没有";
     $("summary-text").textContent =
-      "点右上角「生成纪要」：裁剪过就补「被裁掉的那段」，" +
-      "没裁剪过先按最近 20 条演示；之后每次裁剪自动滚动更新。";
+      "点右上角「生成纪要」：从第一条开始写，只追加不覆盖；" +
+      "之后每次裁剪会自动把新内容续在后面。";
     return;
   }
   $("summary-meta").textContent =
@@ -312,9 +394,8 @@ async function buildSummary() {
   }
   if (!window.confirm(
     "生成前情纪要？\n\n" +
-    "裁剪过：补上被裁掉、还没纪要的那段；\n" +
-    "没裁剪过：先按最近 20 条之前演示一遍。\n" +
-    "之后每次裁剪会自动滚动更新，只处理新裁掉的部分。")) return;
+    "只追加：从上次覆盖到的那条之后，一直写到当前最后一条。\n" +
+    "已有纪要原样保留，不覆盖、不合并重写。")) return;
 
   const btn = $("btn-summary");
   btn.disabled = true;
@@ -553,7 +634,7 @@ function renderFacts() {
   const keyword = state.factFilter.trim().toLowerCase();
   const items = state.facts.filter((item) => {
     if (!keyword) return true;
-    return `${item.claim} ${item.kind} ${item.id}`.toLowerCase().includes(keyword);
+    return `${item.claim} ${item.kind} ${item.id} ${item.uid || ""}`.toLowerCase().includes(keyword);
   });
 
   if (!items.length) {
@@ -570,9 +651,12 @@ function renderFacts() {
     const meta = el("div", "meta");
     meta.append(el("span", `badge kind-${item.kind}`, kindLabel(item.kind)));
     if (item.scope === "people") {
-      const shared = el("span", "badge", "共享");
-      shared.title = "关于某个人的长期事实，他出现的会话都能用";
+      const shared = el("span", "badge", "长期");
+      shared.title = "关于这个人的长期事实";
       meta.append(shared);
+    }
+    if (item.uid) {
+      meta.append(el("span", "chip muted", `id ${item.uid}`));
     }
     meta.append(document.createTextNode(
       `${item.sources} 处出处 · ${fmtTime(item.updated_at)}`));
@@ -593,7 +677,7 @@ async function selectFact(item) {
   body.replaceChildren(el("div", "empty", "读取中…"));
 
   try {
-    const data = unwrap(await apiGet("fact", { id: item.id }));
+    const data = unwrap(await apiGet("fact", { id: item.id, uid: item.uid || state.uid }));
     renderFactDetail(data);
   } catch (err) {
     $("fact-meta").textContent = "";
@@ -617,7 +701,8 @@ function renderFactDetail(data) {
   tags.append(el("span", `badge kind-${data.kind}`, kindLabel(data.kind)));
   if (data.deleted) tags.append(el("span", "tag", "已删除"));
   tags.append(el("span", "chip muted",
-    data.scope === "people" ? "跨会话共享" : "仅本会话"));
+    data.scope === "people" ? "长期事实" : "本会话事实"));
+  if (data.uid) tags.append(el("span", "chip muted", `id ${data.uid}`));
   if (data.subject) tags.append(el("span", "chip muted", `主角 ${data.subject}`));
   tags.append(el("span", "chip", `${sources.length} 处出处`));
   head.append(tags);
@@ -705,9 +790,13 @@ async function loadRefineStatus() {
 }
 
 async function refineFacts() {
+  if (!state.session) {
+    toast("先在左侧选一个会话，再提炼这个 id 的事实", true);
+    return;
+  }
   if (!window.confirm(
     "开始全量提炼？\n\n" +
-    "会扫一遍整个记忆库，按每批字数调用模型；库大的话要几分钟。\n" +
+    "会扫一遍这个 id 的整个记忆库，按每批字数调用模型；库大的话要几分钟。\n" +
     "已有的人物卡会先归档，再整体替换。")) return;
 
   const btn = $("btn-refine");
@@ -716,10 +805,10 @@ async function refineFacts() {
   try {
     let info;
     try {
-      info = unwrap(await apiPost("facts/refine", {}));
+      info = unwrap(await apiPost("facts/refine", { session: state.session }));
     } catch (postErr) {
       // 有些版本的 bridge 只给 GET
-      info = unwrap(await apiGet("facts/refine"));
+      info = unwrap(await apiGet("facts/refine", { session: state.session }));
     }
     toast(info.message || "已开始提炼，完成后会自动刷新");
     btn.textContent = "提炼中…";
@@ -887,6 +976,30 @@ async function exportAll() {
   }
 }
 
+async function verifyMemory() {
+  const button = $("btn-verify-m");
+  button.disabled = true;
+  button.textContent = "校验中…";
+  try {
+    const info = unwrap(await apiGet("verify_m", {}));
+    const counts = info.counts || {};
+    const lines = [
+      info.ok ? "记忆体校验通过" : "记忆体校验失败",
+      `事件 ${counts.events || 0} / 事实 ${counts.facts || 0} / `
+        + `纪要 ${counts.summaries || 0}`,
+      `校验文件 ${info.checked_files || 0} 个`,
+    ];
+    for (const item of (info.errors || []).slice(0, 5)) lines.push(`错误：${item}`);
+    for (const item of (info.warnings || []).slice(0, 3)) lines.push(`警告：${item}`);
+    toast(lines.join("\n"), !info.ok, info.ok ? 8000 : 15000);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "校验记忆体";
+  }
+}
+
 // ---------------------------------------------------------------- 下载
 
 /**
@@ -1028,6 +1141,7 @@ async function runImport() {
       `面板设置：${info.settings_restored ? "已恢复" : "沿用当前"}`,
       `会话状态：${info.state_added ?? 0} 份`,
     ];
+    if (info.takeover_global) lines.push("已开启全局接管（所有会话）");
     if (info.index_rebuilt) lines.push(`索引已重建：${info.index_rebuilt} 条`);
     if (info.astrbot_data_ignored) {
       lines.push("包里的 astrbot_data/ 未还原（要还原请停机手动替换）");
@@ -1081,6 +1195,7 @@ function bind() {
   $("btn-save").addEventListener("click", saveSettings);
   $("btn-reset").addEventListener("click", resetSettings);
   $("btn-export").addEventListener("click", exportAll);
+  $("btn-verify-m").addEventListener("click", verifyMemory);
   $("btn-download").addEventListener("click", downloadSelected);
 
   $("select-all").addEventListener("change", (event) => {
@@ -1099,6 +1214,7 @@ function bind() {
   });
   $("btn-refine").addEventListener("click", refineFacts);
   $("btn-summary").addEventListener("click", buildSummary);
+  $("btn-takeover").addEventListener("click", toggleTakeover);
   $("btn-session-summary").addEventListener("click", toggleSessionSummary);
 
   $("btn-import").addEventListener("click", openImport);
@@ -1128,7 +1244,7 @@ function bind() {
   } catch (err) {
     // ready 失败不阻塞，后面每个请求自己会报错
   }
-  await Promise.all([loadOverview(), loadSessions(), loadSettings()]);
+  await Promise.all([loadOverview(), loadSessions(), loadSettings(), loadTakeover()]);
 
   // 打开面板就直接落在最近一次对话上，而不是一个空白的「选择左侧一个会话」
   if (!state.session && state.sessions.length) {
@@ -1138,4 +1254,9 @@ function bind() {
   // 上次没跑完的提炼/纪要，进来就接着显示进度
   await loadRefineStatus();
   await loadSummaryStatus();
+
+  // 首次裁剪会自动开全局接管；页面开着时也要跟着变，不能一直显示“关”
+  setInterval(() => {
+    if (!document.hidden) loadTakeover();
+  }, 30000);
 })();

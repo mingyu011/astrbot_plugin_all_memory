@@ -17,6 +17,8 @@ import zipfile
 from datetime import datetime, timedelta
 
 SKIP_SUFFIXES = (".tmp", ".part")
+# 导出时由 manifest.attach_to_zip 重新生成，别把上次留下的旧快照打进去。
+SKIP_NAMES = ("manifest.json", "README_M.md")
 
 
 def seconds_until(hhmm: str, now: datetime | None = None) -> float | None:
@@ -106,6 +108,10 @@ def build_zip(target: str, sources, compresslevel: int = 1) -> dict:
                 continue
             for full, arc, is_dir in iter_entries(root, prefix, skips):
                 if arc in seen:
+                    skipped += 1
+                    continue
+                if (not is_dir and os.path.basename(full) in SKIP_NAMES
+                        and arc.startswith("all_memory/")):
                     skipped += 1
                     continue
                 try:

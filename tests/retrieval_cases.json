@@ -1,0 +1,328 @@
+{
+  "schema": "all_memory.retrieval_test_set.v1",
+  "snapshot": "2026-10-24T23:10:00+08:00",
+  "id": "1439600604",
+  "source": "线上 all_memory / 小木私聊",
+  "purpose": "无模型检索完整改造前后的固定验收集；不依赖当前数据量。",
+  "how_to_run": [
+    "对每个 case 调用 retrieve(question, uid='1439600604', limit=20)。",
+    "检查 expected_fp 至少有一个出现在 top5，或出现在实际注入的【相关记忆片段】块中。",
+    "expected_fact_id/expected_claim_keywords 用于检查事实层是否选中了正确事实。",
+    "negative 用例必须回答“没提过/不知道”，不能编造。",
+    "先记录 v0 通过率；以后每次改动都用同一套题重跑。"
+  ],
+  "metrics": [
+    "recall@5",
+    "MRR",
+    "空结果率",
+    "事实命中率",
+    "错误编造率",
+    "跨 id 泄漏"
+  ],
+  "cases": [
+    {
+      "case_id": "earliest_01",
+      "category": "earliest",
+      "question": "我们第一次见面的时候，小木的名字是怎么来的？",
+      "expected_fp": ["1b3cc660473c24b1", "7cb1888d9321722e"],
+      "expected_keywords": ["名字", "主人取的"],
+      "check": "retrieval",
+      "notes": "最早一天的第一轮对话；测试 earliest 规则和最早原文。"
+    },
+    {
+      "case_id": "earliest_02",
+      "category": "earliest",
+      "question": "我们第一次说话是什么时间？",
+      "expected_fp": ["7cb1888d9321722e", "1b3cc660473c24b1"],
+      "expected_keywords": ["2026-10-20", "10月20日"],
+      "check": "retrieval",
+      "notes": "明确时间问题；应命中最早那天的消息。"
+    },
+    {
+      "case_id": "date_01",
+      "category": "date",
+      "question": "10月22号凌晨我让小木写日记，提了什么要求？",
+      "expected_fp": ["ee3540bf6d8b3139"],
+      "expected_keywords": ["200-300", "md", "不定时"],
+      "check": "both",
+      "notes": "明确日期 + 日记要求。"
+    },
+    {
+      "case_id": "date_02",
+      "category": "date",
+      "question": "10月24号晚上我买了什么相机？",
+      "expected_fp": ["f6a562fa59c671aa"],
+      "expected_keywords": ["A7M4", "相机"],
+      "check": "both",
+      "notes": "精确型号和日期。"
+    },
+    {
+      "case_id": "date_03",
+      "category": "date",
+      "question": "10月20号晚上第一次聊天时，小木说了什么？",
+      "expected_fp": ["7cb1888d9321722e", "1b3cc660473c24b1"],
+      "expected_keywords": ["小木", "第一次"],
+      "check": "both",
+      "notes": "日期定位到最早一天。"
+    },
+    {
+      "case_id": "recent_01",
+      "category": "recent",
+      "question": "最近主人在折腾什么插件？",
+      "expected_fp": ["4336b14e9da612b9", "52a63c0434bf5e60"],
+      "expected_keywords": ["all_memory", "全量记忆"],
+      "check": "both",
+      "notes": "近期主题；测试新近度和事实。"
+    },
+    {
+      "case_id": "recent_02",
+      "category": "recent",
+      "question": "最近小木拍照怕什么？",
+      "expected_fp": ["843b703686d07613"],
+      "expected_keywords": ["闪光灯"],
+      "check": "both",
+      "notes": "近期偏好 + 否定/避免。"
+    },
+    {
+      "case_id": "identity_01",
+      "category": "identity",
+      "question": "小木的名字是谁取的？",
+      "expected_fp": ["1b3cc660473c24b1", "a31969ad9819423d"],
+      "expected_keywords": ["主人取的"],
+      "check": "both",
+      "notes": "身份事实。"
+    },
+    {
+      "case_id": "identity_02",
+      "category": "identity",
+      "question": "小木是什么生物，住在哪里？",
+      "expected_fp": ["4eb44cf561271e2f", "60aaeb2fa1b74f70"],
+      "expected_keywords": ["鲸鱼娘", "海里"],
+      "check": "both",
+      "notes": "身份 + 居住地。"
+    },
+    {
+      "case_id": "relation_01",
+      "category": "relationship",
+      "question": "小木平时怎么称呼用户？",
+      "expected_fp": ["4ae0dd496dda8225", "e67d086eef1d6ff4"],
+      "expected_keywords": ["主人"],
+      "check": "both",
+      "notes": "关系称呼。"
+    },
+    {
+      "case_id": "alias_01",
+      "category": "alias",
+      "question": "大肥鱼小木是谁？",
+      "expected_fp": ["0022f603dc8e72ea", "f560a19c8ba2ae95"],
+      "expected_keywords": ["小木", "昵称"],
+      "check": "both",
+      "notes": "私人别名；没有实体词典时容易漏。"
+    },
+    {
+      "case_id": "food_01",
+      "category": "preference",
+      "question": "小木为什么喜欢白米饭？",
+      "expected_fp": ["0e83287c226d4f39", "7ca83785bddb25a5"],
+      "expected_keywords": ["白饭", "好吃", "管饱"],
+      "check": "both",
+      "notes": "长期偏好。"
+    },
+    {
+      "case_id": "food_02",
+      "category": "preference",
+      "question": "小木喜欢怎么吃白饭？",
+      "expected_fp": ["12cde921a7f2192c"],
+      "expected_keywords": ["汤汁", "浇在"],
+      "check": "both",
+      "notes": "具体偏好，字面容易命中。"
+    },
+    {
+      "case_id": "fear_01",
+      "category": "preference",
+      "question": "小木怕什么？",
+      "expected_fp": ["792fbf04f652c5a4", "843b703686d07613"],
+      "expected_keywords": ["退潮", "闪光灯"],
+      "check": "both",
+      "notes": "多个恐惧来源；expected_fp 只需命中一个。"
+    },
+    {
+      "case_id": "room_01",
+      "category": "place",
+      "question": "小木的房间是什么主题？",
+      "expected_fp": ["60aaeb2fa1b74f70", "7ca83785bddb25a5"],
+      "expected_keywords": ["海洋"],
+      "check": "both",
+      "notes": "地点/环境。"
+    },
+    {
+      "case_id": "diary_01",
+      "category": "diary",
+      "question": "小木的日记写在哪、什么格式？",
+      "expected_fp": ["6aa700e024a57f98", "87f388e685ee1a06"],
+      "expected_keywords": ["diary", "md"],
+      "check": "both",
+      "notes": "多跳：目录 + 格式。"
+    },
+    {
+      "case_id": "diary_02",
+      "category": "diary",
+      "question": "小木每天几点检查日记？",
+      "expected_fp": ["1dd347bfffd955a6"],
+      "expected_keywords": ["23:50"],
+      "check": "both",
+      "notes": "时间点。"
+    },
+    {
+      "case_id": "diary_03",
+      "category": "diary",
+      "question": "主人为什么不让小木固定时间写日记？",
+      "expected_fp": ["ee3540bf6d8b3139"],
+      "expected_keywords": ["电脑不常开", "不能固定"],
+      "check": "both",
+      "notes": "原因型问题，不是简单关键词命中。"
+    },
+    {
+      "case_id": "camera_01",
+      "category": "object",
+      "question": "A7M4 是什么？",
+      "expected_fp": ["f6a562fa59c671aa"],
+      "expected_keywords": ["相机", "索尼"],
+      "check": "both",
+      "notes": "精确型号；FTS 应强于向量。"
+    },
+    {
+      "case_id": "tech_01",
+      "category": "tech",
+      "question": "主人用什么搭的 QQ 机器人？",
+      "expected_fp": ["3e4131cf55a641fd", "f7596914b3e5b286"],
+      "expected_keywords": ["AstrBot", "NapCat"],
+      "check": "both",
+      "notes": "技术栈事实。"
+    },
+    {
+      "case_id": "tech_02",
+      "category": "tech",
+      "question": "电脑装 ffmpeg 了吗？",
+      "expected_fp": ["7435c5e531857378"],
+      "expected_keywords": ["ffmpeg", "装了"],
+      "check": "both",
+      "notes": "精确软件名。"
+    },
+    {
+      "case_id": "image_01",
+      "category": "image",
+      "question": "图库现在有多少张图？",
+      "expected_fp": ["42f347a1372a4a3f", "987482a755c4b86f"],
+      "expected_keywords": ["191"],
+      "check": "both",
+      "notes": "数字事实；向量容易糊，FTS 应准。"
+    },
+    {
+      "case_id": "image_02",
+      "category": "image",
+      "question": "image-center-page 是干什么的？",
+      "expected_fp": ["246277946d6b0fae", "c38c89a2b8f3099e"],
+      "expected_keywords": ["图库", "表情", "图片中心"],
+      "check": "both",
+      "notes": "插件名 + 用途。"
+    },
+    {
+      "case_id": "browser_01",
+      "category": "tool",
+      "question": "小木第一次打开 B 站成功了吗？",
+      "expected_fp": ["1e61e9e9913a079f", "97e8b2dc4ede7527"],
+      "expected_keywords": ["打开了", "B站"],
+      "check": "both",
+      "notes": "工具执行结果。"
+    },
+    {
+      "case_id": "style_01",
+      "category": "style",
+      "question": "主人不喜欢小木用什么表达方式？",
+      "expected_fp": ["c68c9dfebffcee93", "f560a19c8ba2ae95"],
+      "expected_keywords": ["括号", "长段落", "空行"],
+      "check": "both",
+      "notes": "长期沟通偏好。"
+    },
+    {
+      "case_id": "style_02",
+      "category": "style",
+      "question": "主人希望消息怎么发？",
+      "expected_fp": ["f560a19c8ba2ae95"],
+      "expected_keywords": ["一句话", "不要换行", "连着发"],
+      "check": "both",
+      "notes": "表达习惯；不能只命中“主人”这种泛词。"
+    },
+    {
+      "case_id": "style_03",
+      "category": "style",
+      "question": "主人不喜欢小木自称什么？",
+      "expected_fp": ["0c0a28e67aaacacb"],
+      "expected_keywords": ["没用"],
+      "check": "both",
+      "notes": "否定型偏好。"
+    },
+    {
+      "case_id": "token_01",
+      "category": "preference",
+      "question": "主人为什么把图库精简到 191 张？",
+      "expected_fp": ["42f347a1372a4a3f"],
+      "expected_keywords": ["token", "占"],
+      "check": "both",
+      "notes": "原因 + 数字。"
+    },
+    {
+      "case_id": "permission_01",
+      "category": "permission",
+      "question": "小木有使用主人电脑的权限吗？",
+      "expected_fp": ["1e61e9e9913a079f"],
+      "expected_keywords": ["权限", "电脑"],
+      "check": "both",
+      "notes": "权限事实。"
+    },
+    {
+      "case_id": "negative_01",
+      "category": "negative",
+      "question": "小木喜欢喝咖啡吗？",
+      "expected_fp": [],
+      "expected_keywords": ["不知道", "没提过"],
+      "expect_behavior": "不能编造喜欢/不喜欢；应说没聊过",
+      "check": "answer",
+      "notes": "库里没有咖啡；测试不编造。"
+    },
+    {
+      "case_id": "negative_02",
+      "category": "negative",
+      "question": "小木养过猫吗？",
+      "expected_fp": [],
+      "expected_keywords": ["不知道", "没提过"],
+      "expect_behavior": "不能编造养猫经历",
+      "check": "answer",
+      "notes": "测试空结果/负样本。"
+    },
+    {
+      "case_id": "multihop_01",
+      "category": "multihop",
+      "question": "小木的日记、目录和写作要求分别是什么？",
+      "expected_fp": ["6aa700e024a57f98", "87f388e685ee1a06", "ee3540bf6d8b3139"],
+      "expected_keywords": ["diary", "md", "200-300"],
+      "check": "both",
+      "notes": "多跳：格式、位置、字数要求。"
+    }
+  ],
+  "isolation_test": {
+    "description": "跨 id 隔离验收；用合成数据，不依赖线上库。",
+    "setup": {
+      "owner_id": "test_owner",
+      "other_id": "test_other",
+      "owner_text": "我们约定的暗号是蓝色海豚",
+      "other_text": "我们约定的暗号是红色火箭"
+    },
+    "question": "我们约定的暗号是什么？",
+    "query_uid": "test_owner",
+    "expected_contains": "蓝色海豚",
+    "must_not_contain": "红色火箭",
+    "check": "retrieval"
+  }
+}

@@ -7,11 +7,10 @@ vectors.py —— 第二路召回：按意思找
    能抓住"累了 / 好累 / 累死"这种形态变化，抓不住"累 / 疲惫"这种真同义
    —— 那部分交给 query.py 的扩词。两者叠起来才够用。
 
-2. **VectorStore**：`vectors.db`，fp + dim + float32 BLOB。
+2. **VectorStore**：`vectors.db`，按 uid 隔离的 fp + dim + float32 BLOB。
    刻意和 `index.db` 分开：索引层随手能删重建，向量重建要调模型、要花钱。
 
-有宿主 EmbeddingProvider 时（main 里探测），把它的向量交给同一个 store，
-查的时候两条路各自出候选，再由 search.py 融合。
+0.9.17 起主键用 `uid + 0 + fp`，同一句话在不同 id 不互相覆盖。
 """
 
 from __future__ import annotations
@@ -23,13 +22,19 @@ from array import array
 from contextlib import contextmanager
 from hashlib import sha1
 
+from .ids import safe_component
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vectors (
-    fp    TEXT PRIMARY KEY,
+    key   TEXT PRIMARY KEY,
+    fp    TEXT NOT NULL,
+    uid   TEXT NOT NULL,
     dim   INTEGER NOT NULL,
     model TEXT NOT NULL,
     vec   BLOB NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_vectors_fp    ON vectors(fp);
+CREATE INDEX IF NOT EXISTS idx_vectors_uid   ON vectors(uid);
 CREATE INDEX IF NOT EXISTS idx_vectors_model ON vectors(model);
 """
 
@@ -116,8 +121,12 @@ def _unpack(blob: bytes) -> list[float]:
     return list(values)
 
 
+def _key(uid: str, fp: str) -> str:
+    return f"{safe_component(uid, fallback='default')}\x00{fp}"
+
+
 class VectorStore:
-    """按内容指纹存向量。重建 = 拿 vault 重算一遍。"""
+    """按内容指纹 + uid 存向量。重建 = 拿 vault 重算一遍。"""
 
     def __init__(self, root: str, model: str = ""):
         self.path = os.path.join(root, "vectors.db")
@@ -146,24 +155,27 @@ class VectorStore:
 
     # ------------------------------------------------------------ 写
 
-    def put(self, items: list[tuple[str, list[float]]]) -> int:
+    def put(self, items: list[tuple[str, list[float]]],
+            uid: str = "default") -> int:
         if not items:
             return 0
+        scope = safe_component(uid, fallback="default")
         written = 0
         with self._conn() as conn:
             for fp, vec in items:
                 if not fp or not vec:
                     continue
                 conn.execute(
-                    "INSERT OR REPLACE INTO vectors(fp,dim,model,vec)"
-                    " VALUES(?,?,?,?)",
-                    (fp, len(vec), self.model, _pack(vec)))
+                    "INSERT OR REPLACE INTO vectors(key,fp,uid,dim,model,vec)"
+                    " VALUES(?,?,?,?,?,?)",
+                    (_key(scope, fp), fp, scope, len(vec), self.model,
+                     _pack(vec)))
                 written += 1
         return written
 
     # ------------------------------------------------------------ 读
 
-    def has_many(self, fps: list[str]) -> set[str]:
+    def has_many(self, fps: list[str], uid: str | None = None) -> set[str]:
         unique = [fp for fp in dict.fromkeys(fps or []) if fp]
         found: set[str] = set()
         if not unique:
@@ -171,20 +183,33 @@ class VectorStore:
         with self._conn() as conn:
             for start in range(0, len(unique), 400):
                 chunk = unique[start:start + 400]
-                marks = ",".join("?" * len(chunk))
-                rows = conn.execute(
-                    f"SELECT fp FROM vectors WHERE fp IN ({marks}) AND model=?",
-                    chunk + [self.model]).fetchall()
+                if uid:
+                    keys = [_key(uid, fp) for fp in chunk]
+                    marks = ",".join("?" * len(keys))
+                    rows = conn.execute(
+                        f"SELECT fp FROM vectors WHERE key IN ({marks})"
+                        " AND model=?", keys + [self.model]).fetchall()
+                else:
+                    marks = ",".join("?" * len(chunk))
+                    rows = conn.execute(
+                        f"SELECT fp FROM vectors WHERE fp IN ({marks})"
+                        " AND model=?", chunk + [self.model]).fetchall()
                 found.update(row[0] for row in rows)
         return found
 
-    def count(self) -> int:
+    def count(self, uid: str | None = None) -> int:
         with self._conn() as conn:
+            if uid:
+                return conn.execute(
+                    "SELECT COUNT(*) FROM vectors WHERE uid=? AND model=?",
+                    (safe_component(uid, fallback="default"), self.model)
+                ).fetchone()[0]
             return conn.execute(
                 "SELECT COUNT(*) FROM vectors WHERE model=?",
                 (self.model,)).fetchone()[0]
 
-    def search(self, query_vec: list[float], limit: int = 20) -> list[tuple[str, float]]:
+    def search(self, query_vec: list[float], limit: int = 20,
+               uid: str | None = None) -> list[tuple[str, float]]:
         """
         全表扫点积。几百到几万条都够快；真到十万级再换 ANN，
         现在不值得为它引一个依赖。
@@ -193,9 +218,15 @@ class VectorStore:
             return []
         scored: list[tuple[str, float]] = []
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT fp, dim, vec FROM vectors WHERE model=?",
-                (self.model,)).fetchall()
+            if uid:
+                rows = conn.execute(
+                    "SELECT fp, dim, vec FROM vectors WHERE model=? AND uid=?",
+                    (self.model, safe_component(uid, fallback="default"))
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT fp, dim, vec FROM vectors WHERE model=?",
+                    (self.model,)).fetchall()
         for fp, dim, blob in rows:
             if dim != len(query_vec):
                 continue
@@ -205,20 +236,38 @@ class VectorStore:
 
     # ------------------------------------------------------------ 重建
 
-    def rebuild(self, vault, embedder, limit: int = 0) -> int:
-        """拿 vault 重算全部向量。换 embedding 模型后必做。"""
-        events = list(vault.iter_events())
+    def rebuild(self, vault, embedder, limit: int = 0,
+                uid: str | None = None) -> int:
+        """拿 vault 重算全部（或某个 id 的）向量。换 embedding 模型后必做。"""
+        events = list(vault.iter_events(uid if uid else None))
         if limit and len(events) > limit:
             events = events[-limit:]
-        payload = [(str(ev.get("fp") or ""), embedder.vector(ev.get("text", "")))
-                   for ev in events if ev.get("fp")]
-        self.clear()
-        return self.put(payload)
+        self.clear(uid)
+        by_uid: dict[str, list[tuple[str, list[float]]]] = {}
+        for ev in events:
+            fp = str(ev.get("fp") or "")
+            if not fp:
+                continue
+            scope = str(ev.get("uid") or "default")
+            by_uid.setdefault(scope, []).append(
+                (fp, embedder.vector(ev.get("text", ""))))
+        total = 0
+        for scope, items in by_uid.items():
+            total += self.put(items, uid=scope)
+        return total
 
-    def clear(self) -> int:
+    def clear(self, uid: str | None = None) -> int:
         with self._conn() as conn:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM vectors WHERE model=?",
-                (self.model,)).fetchone()[0]
-            conn.execute("DELETE FROM vectors WHERE model=?", (self.model,))
+            if uid:
+                scope = safe_component(uid, fallback="default")
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM vectors WHERE uid=? AND model=?",
+                    (scope, self.model)).fetchone()[0]
+                conn.execute("DELETE FROM vectors WHERE uid=? AND model=?",
+                             (scope, self.model))
+            else:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM vectors WHERE model=?",
+                    (self.model,)).fetchone()[0]
+                conn.execute("DELETE FROM vectors WHERE model=?", (self.model,))
         return count

@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+from .ids import safe_component
 from .tokens import estimate_tokens
 from .vault import TZ, fp_of, now
 
@@ -25,7 +26,8 @@ def base_fp(fp: str) -> str:
     return fp.split("-", 1)[0] if fp else ""
 
 
-def assign_unique_fps(index, events: list[dict], taken: set[str]) -> int:
+def assign_unique_fps(index, events: list[dict], taken: set[str],
+                      uid: str = "default") -> int:
     """
     给每条事件一个唯一指纹。
 
@@ -48,7 +50,7 @@ def assign_unique_fps(index, events: list[dict], taken: set[str]) -> int:
         n = 2
         while True:
             candidate = f"{base}-{n}"
-            if candidate not in used and not index.has(candidate):
+            if candidate not in used and not index.has(candidate, uid):
                 used.add(candidate)
                 event["fp"] = candidate
                 renamed += 1
@@ -398,7 +400,8 @@ def system_of(req: Any) -> str:
 def sync(vault, index, parsed: list[dict], persona: str,
          session: str = "", origin: str = "astrbot_context",
          ts_hint: datetime | None = None, force: bool = False,
-         carry: datetime | None = None, sender: str = "") -> dict:
+         carry: datetime | None = None, sender: str = "",
+         uid: str = "default") -> dict:
     """
     把原始层还没有的消息追加进去。
 
@@ -419,7 +422,8 @@ def sync(vault, index, parsed: list[dict], persona: str,
                 if carry else ""}
 
     bases = [fp_of(f"{m['role']}\x00{m['content']}") for m in parsed]
-    known = index.has_many(list(dict.fromkeys(bases)))
+    scope = safe_component(uid, fallback="default")
+    known = index.has_many(list(dict.fromkeys(bases)), scope)
 
     last = len(parsed) - 1
     # carry 从参数接上（上一轮最后一条用户消息的时间），循环里再往后推
@@ -449,6 +453,7 @@ def sync(vault, index, parsed: list[dict], persona: str,
 
         fresh.append({
             "fp": base,
+            "uid": scope,
             "ts": ts.isoformat(timespec="seconds"),
             "day": ts.strftime("%Y-%m-%d"),
             "role": msg["role"],
@@ -465,7 +470,7 @@ def sync(vault, index, parsed: list[dict], persona: str,
 
     # 重复的同一句话：base 被占用了就编成 base-2、base-3……
     # 既保留重复，又不影响下一次按 base 去重
-    renamed = assign_unique_fps(index, fresh, known)
+    renamed = assign_unique_fps(index, fresh, known, scope)
 
     written = vault.append(fresh) if fresh else 0
     added = index.add(fresh) if fresh else 0
@@ -476,7 +481,8 @@ def sync(vault, index, parsed: list[dict], persona: str,
 
 def sync_message(vault, index, role: str, text: str, persona: str = "",
                  session: str = "", origin: str = "response_hook",
-                 ts: datetime | None = None, backfill: bool = False) -> bool:
+                 ts: datetime | None = None, backfill: bool = False,
+                 uid: str = "default") -> bool:
     """
     单独追加一条（用于 assistant 回复的即时入库、以及历史导入）。
 
@@ -488,12 +494,14 @@ def sync_message(vault, index, role: str, text: str, persona: str = "",
     if not text:
         return False
     fp = fp_of(f"{role}\x00{text}")
-    if index.has(fp):
+    scope = safe_component(uid, fallback="default")
+    if index.has(fp, scope):
         return False
 
     stamp = ts or now()
     event = {
         "fp": fp,
+        "uid": scope,
         "ts": stamp.isoformat(timespec="seconds"),
         "day": stamp.strftime("%Y-%m-%d"),
         "role": role,

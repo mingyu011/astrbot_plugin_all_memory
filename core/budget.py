@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import json
 
+from .ids import safe_component
 from .tokens import estimate_tokens
 
 # 预算默认值（都是占窗口的比例）
@@ -38,7 +39,7 @@ DEFAULTS = {
     "facts_max": 0.10,       # facts 预算（固定，不随裁剪次数增长）
     "map_ratio": 0.03,       # 记忆地图（固定）
     "recall_ratio": 0.05,    # 检索片段（固定）
-    "summary_ratio": 0.03,   # 前情纪要（固定，从历史里扣）
+    "summary_ratio": 0.05,   # 前情纪要（固定，从历史里扣）
 }
 
 
@@ -68,6 +69,22 @@ def total_request_tokens(system: int, history: int, payload: int) -> int:
     """
     return max(0, int(system or 0)) + max(0, int(history or 0)) \
         + max(0, int(payload or 0))
+
+
+def takeover_mode(state: dict) -> str:
+    """
+    这个会话现在处于哪种接管状态。
+
+    auto：还没接管，第一次裁剪时自动开（默认）
+    on  ：已经接管，每轮注入记忆（手动开或首次裁剪自动开）
+    off ：手动关闭，不裁剪、不注入，交回 AstrBot 原生上下文
+    """
+    data = state or {}
+    if str(data.get("takeover_manual") or "") == "off":
+        return "off"
+    if data.get("trimmed_mode"):
+        return "on"
+    return "auto"
 
 
 class Plan:
@@ -104,13 +121,16 @@ def decide(parsed: list[dict], system_tokens: int, window: int,
            facts_ratio: float = 0.01,
            map_ratio: float = 0.03,
            recall_ratio: float = 0.05,
-           summary_ratio: float = 0.03) -> Plan:
+           summary_ratio: float = 0.05,
+           trusted_tokens: int = 0) -> Plan:
     """
     决定这一轮要不要裁剪，以及裁到什么程度。
 
     parsed         : [{idx, role, content}]，按原始顺序
     system_tokens  : system prompt 的原始估算（插件不改它，但算进压力和预算）
     window         : 真实上下文窗口
+    trusted_tokens : AstrBot 上一次请求的真实 token 总量；>0 时优先用它判断压力，
+                     不再用字符估算。这是「按宿主实际注入量算 80%」的入口。
     facts_ratio    : 本轮 facts 预算（由裁剪次数决定）
     summary_ratio  : 前情纪要预算。它是叙事层，和 facts 各管一头：
                      纪要讲"发生了什么"，人物卡讲"她是谁"。
@@ -123,7 +143,10 @@ def decide(parsed: list[dict], system_tokens: int, window: int,
 
     raw_history = sum(estimate_tokens(m["content"]) for m in parsed)
     raw_total = raw_history + system_tokens
-    measured = calibrator.apply(raw_total)
+    if trusted_tokens and trusted_tokens > 0:
+        measured = int(trusted_tokens)
+    else:
+        measured = calibrator.apply(raw_total)
     pressure = measured / window
 
     if pressure < trigger_ratio:
@@ -179,20 +202,18 @@ def decide(parsed: list[dict], system_tokens: int, window: int,
 
 
 class StateStore:
-    """每个会话一份轻量状态：校准比例、裁剪次数、上次用量。"""
+    """每个 id 一份轻量状态：校准比例、裁剪次数、上次用量。"""
 
     def __init__(self, root: str):
         self.dir = os.path.join(root, "state")
         os.makedirs(self.dir, exist_ok=True)
 
-    @staticmethod
-    def _key(session: str) -> str:
-        safe = "".join(ch if ch.isalnum() or ch in "-_." else "_"
-                       for ch in (session or "default"))[:120]
-        return f"{safe or 'default'}.json"
+    def _path(self, uid: str) -> str:
+        safe = safe_component(uid, fallback="default")
+        return os.path.join(self.dir, safe, "state.json")
 
-    def load(self, session: str) -> dict:
-        path = os.path.join(self.dir, self._key(session))
+    def load(self, uid: str) -> dict:
+        path = self._path(uid)
         if not os.path.exists(path):
             return {}
         try:
@@ -202,10 +223,11 @@ class StateStore:
         except (OSError, json.JSONDecodeError):
             return {}
 
-    def save(self, session: str, data: dict) -> None:
-        path = os.path.join(self.dir, self._key(session))
+    def save(self, uid: str, data: dict) -> None:
+        path = self._path(uid)
         tmp = path + ".tmp"
         try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(tmp, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
@@ -213,19 +235,20 @@ class StateStore:
             pass
 
     def all_states(self) -> dict[str, dict]:
-        """读全部会话状态，供 WebUI 展示用量。"""
+        """读全部 id 状态，供 WebUI 展示用量。"""
         out: dict[str, dict] = {}
         if not os.path.isdir(self.dir):
             return out
         for name in os.listdir(self.dir):
-            if not name.endswith(".json"):
-                continue
             path = os.path.join(self.dir, name)
+            if not os.path.isdir(path):
+                continue
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(os.path.join(path, "state.json"),
+                          "r", encoding="utf-8") as f:
                     data = json.load(f)
             except (OSError, json.JSONDecodeError):
                 continue
             if isinstance(data, dict):
-                out[name[:-5]] = data
+                out[name] = data
         return out

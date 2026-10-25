@@ -55,6 +55,46 @@ def estimate_messages(messages: list[dict]) -> int:
     return total
 
 
+def usage_input_tokens(usage) -> int:
+    """
+    从不同形态的 usage 里抠出 **输入** token 数。
+
+    AstrBot 的 TokenUsage 是 input_other + input_cached + output，
+    没有 prompt_tokens 字段；旧代码只认 prompt_tokens，所以校准一直没生效。
+    """
+    if usage is None:
+        return 0
+
+    def _positive(value) -> int:
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+        return 0
+
+    if isinstance(usage, dict):
+        for key in ("input", "prompt_tokens", "input_tokens", "promptTokens"):
+            found = _positive(usage.get(key))
+            if found:
+                return found
+        other = _positive(usage.get("input_other"))
+        cached = _positive(usage.get("input_cached"))
+        if other or cached:
+            return other + cached
+        return 0
+
+    for key in ("input", "prompt_tokens", "input_tokens", "promptTokens"):
+        found = _positive(getattr(usage, key, None))
+        if found:
+            return found
+
+    other = _positive(getattr(usage, "input_other", None))
+    cached = _positive(getattr(usage, "input_cached", None))
+    if other or cached:
+        return other + cached
+    return 0
+
+
 class Calibrator:
     """
     EMA 校准器。state 里存一个比例，实际估算 = 原始估算 × ratio。

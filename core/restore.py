@@ -62,7 +62,8 @@ def inspect_zip(path: str) -> dict:
         "ok": False, "error": "",
         "has_all_memory": False, "has_astrbot_data": False,
         "vault_days": 0, "vault_records": 0, "personas": 0,
-        "facts": 0, "summaries": 0, "blobs": 0, "media_days": 0,
+        "facts": 0, "summaries": 0, "entities": 0, "synonyms": 0,
+        "blobs": 0, "media_days": 0,
         "size": 0,
     }
     if not os.path.isfile(path):
@@ -90,6 +91,10 @@ def inspect_zip(path: str) -> dict:
                     info["facts"] += 1
                 elif tail.startswith("summaries/") and tail.endswith(".json"):
                     info["summaries"] += 1
+                elif tail.startswith("entities/") and tail.endswith(".json"):
+                    info["entities"] += 1
+                elif tail.startswith("synonyms/") and tail.endswith(".json"):
+                    info["synonyms"] += 1
                 elif tail.startswith("blobs/"):
                     info["blobs"] += 1
                 elif tail.startswith("media/") and tail.endswith(".jsonl"):
@@ -122,6 +127,7 @@ def _normalize_event(raw: dict) -> dict | None:
         return None
     return {
         "fp": fp,
+        "uid": raw.get("uid"),
         "ts": ts,
         "day": day,
         "role": role,
@@ -148,6 +154,8 @@ def restore_zip(path: str, root: str, vault, index,
         "events_seen": 0, "events_added": 0, "events_skipped": 0,
         "personas_added": 0, "facts_added": 0, "blobs_added": 0,
         "summaries_added": 0,
+        "entities_added": 0,
+        "synonyms_added": 0,
         "media_added": 0, "media_skipped": 0,
         "settings_restored": 0, "state_added": 0, "archive_added": 0,
         "index_copied": 0,
@@ -187,9 +195,11 @@ def restore_zip(path: str, root: str, vault, index,
                 tail = name[len(PREFIX):]
 
                 if tail.startswith("vault/") and tail.endswith(".jsonl"):
+                    parts = tail.split("/")
+                    uid = parts[1] if len(parts) > 2 else ""
                     seen, added, skipped, found = _restore_vault_member(
                         zf, raw_name, vault, index, should_cancel,
-                        fp_counter, fp_used)
+                        fp_counter, fp_used, uid)
                     result["events_seen"] += seen
                     result["events_added"] += added
                     result["events_skipped"] += skipped
@@ -208,13 +218,21 @@ def restore_zip(path: str, root: str, vault, index,
                     if _extract_if_missing(zf, raw_name, root, tail):
                         result["summaries_added"] += 1
 
+                elif tail.startswith("entities/") and tail.endswith(".json"):
+                    if _extract_if_missing(zf, raw_name, root, tail):
+                        result["entities_added"] += 1
+
+                elif tail.startswith("synonyms/") and tail.endswith(".json"):
+                    if _extract_if_missing(zf, raw_name, root, tail):
+                        result["synonyms_added"] += 1
+
                 elif tail.startswith("blobs/"):
                     if _extract_if_missing(zf, raw_name, root, tail):
                         result["blobs_added"] += 1
 
                 elif tail.startswith("media/") and tail.endswith(".jsonl"):
                     added, skipped = _restore_media_member(
-                        zf, raw_name, root, existing_media)
+                        zf, raw_name, root, tail, existing_media)
                     result["media_added"] += added
                     result["media_skipped"] += skipped
 
@@ -261,7 +279,7 @@ def restore_zip(path: str, root: str, vault, index,
 # ------------------------------------------------------------------ 内部
 
 def _restore_vault_member(zf, member, vault, index, should_cancel,
-                          fp_counter=None, fp_used=None):
+                          fp_counter=None, fp_used=None, uid: str = ""):
     seen = added = skipped = 0
     events: list[dict] = []
     sessions: set[str] = set()
@@ -279,6 +297,8 @@ def _restore_vault_member(zf, member, vault, index, should_cancel,
             seen += 1
             event = _normalize_event(raw)
             if event:
+                if uid:
+                    event["uid"] = uid
                 events.append(event)
                 if event.get("session"):
                     sessions.add(str(event["session"]))
@@ -288,8 +308,9 @@ def _restore_vault_member(zf, member, vault, index, should_cancel,
 
     # 旧包里可能有多行共用一个指纹，先按出现顺序编号，别在恢复时被合并掉
     normalize_duplicate_fps(events, fp_counter, fp_used)
+    scope = str(events[0].get("uid") or "") or None
     fingerprints = [e["fp"] for e in events]
-    known = index.has_many(fingerprints)
+    known = index.has_many(fingerprints, scope)
     fresh = [e for e in events if e["fp"] not in known]
     skipped = len(events) - len(fresh)
 
@@ -336,24 +357,25 @@ def _load_media_keys(root: str) -> set:
     media_dir = os.path.join(root, "media")
     if not os.path.isdir(media_dir):
         return keys
-    for name in os.listdir(media_dir):
-        if not name.endswith(".jsonl"):
-            continue
-        try:
-            with open(os.path.join(media_dir, name), "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    key = _media_key(row)
-                    if key:
-                        keys.add(key)
-        except OSError:
-            continue
+    for dirpath, _dirnames, filenames in os.walk(media_dir):
+        for name in filenames:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                with open(os.path.join(dirpath, name), "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        key = _media_key(row)
+                        if key:
+                            keys.add(key)
+            except OSError:
+                continue
     return keys
 
 
@@ -363,7 +385,7 @@ def _media_key(row: dict) -> str:
     return f"{fu}|{','.join(hashes)}" if fu else ""
 
 
-def _restore_media_member(zf, member, root, existing: set):
+def _restore_media_member(zf, member, root, tail: str, existing: set):
     rows = []
     with zf.open(member) as f:
         for line in f:
@@ -385,9 +407,11 @@ def _restore_media_member(zf, member, root, existing: set):
     if not rows:
         return 0, 0
 
-    media_dir = os.path.join(root, "media")
+    parts = tail.replace("\\", "/").split("/")
+    # 新结构 media/<id>/<day>.jsonl；老结构 media/<day>.jsonl
+    uid = parts[1] if len(parts) > 2 else "default"
+    media_dir = os.path.join(root, "media", uid)
     os.makedirs(media_dir, exist_ok=True)
-    # 按记录自己的日期分文件，保持和原结构一致
     by_day: dict[str, list[dict]] = {}
     for row in rows:
         day = str(row.get("ts", ""))[:10] or "unknown"

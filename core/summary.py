@@ -1,20 +1,11 @@
 """
-summary.py —— 阶段纪要（滚动）
+summary.py —— 阶段纪要（只追加）
 
-裁掉的那段原文不在眼前了，"最近发生了什么"就断了。这一层把它压成一份带日期的
-纪要，补的是**叙事**，不替代原文：
+0.9.17 起按 id 分目录：`summaries/<id>/summary.json`。
+一个私聊 id 一个滚动文件；每次裁剪只处理还没纪要过的历史，追加到文件，
+不覆盖旧内容、不合并重写。
 
-    原文永远在 vault 里，纪要只是"前情提要"，模糊了还能查回去。
-
-三条硬约束
-----------
-1. **滚动**：只把"这次新被裁掉的那一段"并进旧纪要，绝不每次重算全量。
-   否则成本和漂移都会失控。
-2. **按会话**：叙事是会话内的，两个群的经历不能串。
-3. **带日期**：每条要点标时间范围，模型才能顺着时间回查原文。
-
-纪要里明确写着"可能有偏差，引用前先核对原文"——这句话 beyond 写不了，
-因为它压完就把原文丢了。
+原文永远在 vault 里，纪要只是"前情提要"，模糊了还能查回去。
 """
 
 from __future__ import annotations
@@ -22,9 +13,12 @@ from __future__ import annotations
 import os
 import json
 import hashlib
+import re
+import difflib
 from datetime import datetime
 from typing import Awaitable, Callable
 
+from .ids import safe_component
 from .vault import now
 from .tokens import estimate_tokens
 
@@ -32,7 +26,7 @@ LLMCall = Callable[[str], Awaitable[str]]
 
 SEGMENT_MAX_LINES = 8
 MAX_SUMMARY_CHARS = 2000
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 
 ROLE_NAMES = {"user": "对方", "assistant": "机器人", "tool": "工具",
               "system": "系统", "summary": "摘要", "memory": "记忆"}
@@ -41,7 +35,113 @@ ROLE_NAMES = {"user": "对方", "assistant": "机器人", "tool": "工具",
 _EMPTY_MARKERS = {"（这段时间没什么事）", "(这段时间没什么事)",
                   "（这段时间没什么事。）", "本段无内容"}
 
-SEGMENT_PROMPT = """你在整理一段即将从上下文里淡出的聊天记录。
+_PLACEHOLDER_RE = re.compile(
+    r"^[（(【\[]?\s*(?:这段时间)?\s*(?:没|无|空|没有)\s*"
+    r"(?:什么|值得记录)?\s*(?:内容|事)?\s*[)）】\]]?$")
+_PREFIX_RE = re.compile(
+    r"^(\d{1,2})-(\d{1,2})"
+    r"(?:\s+(凌晨|早上|上午|中午|下午|傍晚|晚上|晚|早|深夜"
+    r"|\d{1,2}:\d{2}(?:-\d{1,2}(?::\d{2})?)?|\d{1,2}:\d{2}))?"
+    r"\s*[：:]\s*")
+
+_SLOT_RANK = {
+    "凌晨": 1 * 60, "早上": 7 * 60, "早": 7 * 60,
+    "上午": 9 * 60, "中午": 12 * 60,
+    "下午": 14 * 60, "傍晚": 17 * 60, "晚上": 19 * 60, "晚": 19 * 60,
+    "深夜": 23 * 60,
+}
+
+
+def is_placeholder(line: str) -> bool:
+    """模型表示“这段没内容”的各种变体，统一挡掉。"""
+    text = str(line or "").strip().strip("-*• ").strip()
+    if not text:
+        return True
+    if text in _EMPTY_MARKERS:
+        return True
+    bare = text.strip("（）()【】[] 。.").strip()
+    if bare in {"空", "无", "空内容", "无内容", "本段无内容",
+                "没有内容", "没什么事", "这段时间没什么事",
+                "无值得记录的内容", "没有值得记录的内容",
+                "无值得记录的事", "没有值得记录的事"}:
+        return True
+    return bool(_PLACEHOLDER_RE.match(text))
+
+
+def _line_key(line: str) -> tuple:
+    """按 MM-DD + 时间排序；解析不了放最后。"""
+    match = _PREFIX_RE.match(str(line or ""))
+    if not match:
+        return (99, 99, 99 * 60)
+    month, day, slot = match.groups()
+    if slot and ":" in slot:
+        hour, minute = slot.split("-", 1)[0].split(":", 1)
+        rank = int(hour) * 60 + int(minute)
+    else:
+        rank = _SLOT_RANK.get(slot or "", 12 * 60)
+    return (int(month), int(day), rank)
+
+
+def _body(line: str) -> str:
+    text = _PREFIX_RE.sub("", str(line or "")).strip()
+    return re.sub(r"[\s，。！？、；：,.!?;:~…\-—\"'“”‘’（）()\[\]【】{}<>《》/\\|]+",
+                  "", text)
+
+
+def clean_text(text: str) -> str:
+    """
+    清理已有纪要：去占位、去精确重复、按日期/时间排序、合并同时刻近义句。
+
+    只处理文本，不动 covered_fp / covered_index；调用方决定是否落盘。
+    """
+    lines: list[str] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or is_placeholder(line):
+            continue
+        lines.append(line)
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        key = re.sub(r"\s+", "", line)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(line)
+
+    unique.sort(key=_line_key)
+
+    out: list[str] = []
+    for line in unique:
+        key = _line_key(line)
+        body = _body(line)
+        merged = False
+        # 同一天同一时刻的“同义改写”只留一条；不做跨时间合并。
+        if key[0] != 99 and body:
+            for index, existing in enumerate(out):
+                if _line_key(existing) != key:
+                    continue
+                existing_body = _body(existing)
+                if not existing_body:
+                    continue
+                if body == existing_body or body in existing_body \
+                        or existing_body in body:
+                    if len(body) > len(existing_body):
+                        out[index] = line
+                    merged = True
+                    break
+                if difflib.SequenceMatcher(None, body, existing_body).ratio() >= 0.60:
+                    if len(body) > len(existing_body):
+                        out[index] = line
+                    merged = True
+                    break
+        if not merged:
+            out.append(line)
+    return "\n".join(out)
+
+SEGMENT_PROMPT = """你在整理一段聊天记录，写进这个人的长期前情纪要。
+
 目标只有一个：让机器人以后读到这份纪要时，知道"这段时间发生了什么"。
 
 写法：
@@ -55,23 +155,6 @@ SEGMENT_PROMPT = """你在整理一段即将从上下文里淡出的聊天记录
 LINES
 
 只输出纪要本身，不要解释、不要 JSON。
-"""
-
-MERGE_PROMPT = """下面是同一段历史的旧纪要，和刚新增的一段。请合并成一份新纪要。
-
-要求：
-- 按时间顺序，一行一条，以时间开头
-- 旧内容可以压缩，但不能丢掉重要的事件、约定、转折
-- 总长度不超过 MAX_CHARS 字；超了先砍寒暄和重复，别砍事件
-- 不要写"她是谁、喜欢什么"（那是人物卡的事）
-
-旧纪要：
-OLD
-
-新增：
-NEW
-
-只输出合并后的纪要，不要解释。
 """
 
 
@@ -94,14 +177,14 @@ def normalize_lines(raw: str, max_lines: int = SEGMENT_MAX_LINES) -> str:
         line = line.strip().strip("-*• ").strip()
         if not line:
             continue
-        # 空批次的占位句不能混进纪要中间
-        if line in _EMPTY_MARKERS:
+        if is_placeholder(line):
             continue
         if len(line) > 150:
             line = line[:150] + "…"
         lines.append(line)
         if max_lines and len(lines) >= max_lines:
             break
+    lines.sort(key=_line_key)
     return "\n".join(lines)
 
 
@@ -124,61 +207,86 @@ def build_segment_prompt(batch: list[dict], max_lines: int = SEGMENT_MAX_LINES) 
             .replace("LINES", transcript(batch)))
 
 
-def build_merge_prompt(old: str, new: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
-    return (MERGE_PROMPT
-            .replace("MAX_CHARS", str(max(200, int(max_chars or 200))))
-            .replace("OLD", str(old or "（无）").strip())
-            .replace("NEW", str(new or "（无）").strip()))
-
-
 class SummaryStore:
-    """一份会话一份纪要：summaries/<会话键>.json"""
+    """一个 id 一份滚动纪要：summaries/<id>/summary.json"""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, uid: str = "default"):
+        self.root = root
+        self.uid = safe_component(uid, fallback="default")
         self.dir = os.path.join(root, "summaries")
-        os.makedirs(self.dir, exist_ok=True)
+        self._dir(self.uid)
 
-    @staticmethod
-    def _key(session: str) -> str:
-        safe = "".join(ch if ch.isalnum() or ch in "-_." else "_"
-                       for ch in (session or "default"))[:120]
-        return safe or "default"
+    def _dir(self, uid: str) -> str:
+        path = os.path.join(self.dir, safe_component(uid, fallback="default"))
+        os.makedirs(path, exist_ok=True)
+        return path
 
-    def _path(self, session: str) -> str:
-        return os.path.join(self.dir, self._key(session) + ".json")
+    def _path(self, uid: str | None = None) -> str:
+        scope = safe_component(uid or self.uid, fallback="default")
+        return os.path.join(self._dir(scope), "summary.json")
 
-    def load(self, session: str) -> dict:
-        path = self._path(session)
+    def load(self, uid: str | None = None) -> dict:
+        path = self._path(uid)
         if not os.path.exists(path):
             return {}
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError):
             return {}
+        if not isinstance(data, dict):
+            return {}
+        # 旧文件里可能混着占位符、重复句、乱序行；读的时候先清一遍，
+        # 保证注入到模型的是干净版本。repair() 才会落盘。
+        if str(data.get("text") or "").strip():
+            data["text"] = clean_text(str(data.get("text") or ""))
+            data["chars"] = len(data["text"])
+        return data
 
-    def save(self, session: str, data: dict) -> None:
-        path = self._path(session)
+    def save(self, data: dict, uid: str | None = None) -> None:
+        path = self._path(uid)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
+
+    def repair(self, uid: str | None = None) -> dict:
+        """把当前 summary.json 里的占位/重复/乱序清掉并落盘。"""
+        path = self._path(uid)
+        if not os.path.exists(path):
+            return {"ok": False, "error": "还没有纪要", "before": 0, "after": 0}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": str(exc), "before": 0, "after": 0}
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "summary 不是对象", "before": 0, "after": 0}
+        before = str(data.get("text") or "")
+        after = clean_text(before)
+        data["text"] = after
+        data["chars"] = len(after)
+        data["repaired_at"] = _now_iso()
+        self.save(data, uid)
+        return {"ok": True, "before": len(before), "after": len(after),
+                "removed": max(0, len(before) - len(after)),
+                "path": path}
 
     def all(self) -> dict[str, dict]:
         out: dict[str, dict] = {}
         if not os.path.isdir(self.dir):
             return out
         for name in os.listdir(self.dir):
-            if not name.endswith(".json"):
+            path = os.path.join(self.dir, name, "summary.json")
+            if not os.path.isfile(path):
                 continue
             try:
-                with open(os.path.join(self.dir, name), "r", encoding="utf-8") as f:
+                with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except (OSError, json.JSONDecodeError):
                 continue
             if isinstance(data, dict):
-                out[name[:-5]] = data
+                out[name] = data
         return out
 
     def stats(self) -> dict:
@@ -190,12 +298,13 @@ class SummaryStore:
 
 
 class SummaryCache:
-    """按批缓存：同一批原文的纪要永远一样，裁剪第二次就不用再调模型。"""
+    """按批缓存：同一批原文的纪要永远一样。按 id 分目录。"""
 
-    VERSION = "v1"
+    VERSION = "v2"
 
-    def __init__(self, root: str):
-        self.dir = os.path.join(root, "cache", "summary")
+    def __init__(self, root: str, uid: str = "default"):
+        self.dir = os.path.join(root, "cache", "summary",
+                                safe_component(uid, fallback="default"))
         os.makedirs(self.dir, exist_ok=True)
 
     @staticmethod
@@ -234,45 +343,46 @@ class SummaryCache:
                 pass
 
 
-def boundary_index(events: list[dict], boundary_fp: str,
-                   keep_recent: int = 20) -> int:
+def _covered_start(events: list[dict], covered_fp: str,
+                   covered_index: int = 0) -> int:
     """
-    纪要覆盖到哪一条为止（不含）。
+    上次纪要覆盖到哪了：优先用条数游标，其次精确指纹，最后才退回基础指纹。
 
-    boundary_fp 是"第一 条仍然留在上下文里的消息"，它之前的一切都该被纪要到。
-    找不到边界（重建过、编号变了）就退回"最后 keep_recent 条不动"。
+    旧实现只按 base_fp 找，遇到 abc / abc-2 这种重复句会退回到 abc，
+    把已经纪要过的尾部重新总结一遍，越追加越重复。
     """
     from .sync import base_fp
 
-    target = base_fp(str(boundary_fp or ""))
+    try:
+        index = int(covered_index or 0)
+    except (TypeError, ValueError):
+        index = 0
+    if 0 < index <= len(events):
+        return index
+
+    target = str(covered_fp or "")
     if target:
-        for index, event in enumerate(events):
-            if base_fp(str(event.get("fp", ""))) == target:
-                return index
-    return max(0, len(events) - max(1, int(keep_recent or 1)))
+        for position, event in enumerate(events):
+            if str(event.get("fp", "")) == target:
+                return position + 1
 
-
-def _covered_start(events: list[dict], covered_fp: str, end: int) -> int:
-    """上次纪要覆盖到哪了：从它的下一条开始，避免重复总结。"""
-    from .sync import base_fp
-
-    target = base_fp(str(covered_fp or ""))
+    target = base_fp(target)
     if not target:
         return 0
-    for index, event in enumerate(events[:end]):
+    for position, event in enumerate(events):
         if base_fp(str(event.get("fp", ""))) == target:
-            return index + 1
+            return position + 1
     return 0
 
 
 async def build(llm_call: LLMCall, events: list[dict], store: SummaryStore,
-                session: str, boundary_fp: str = "", chunk_chars: int = 6000,
-                max_chars: int = MAX_SUMMARY_CHARS, cache: "SummaryCache | None" = None,
-                keep_recent: int = 20, max_lines: int = SEGMENT_MAX_LINES) -> dict:
+                chunk_chars: int = 6000, cache: "SummaryCache | None" = None,
+                max_lines: int = SEGMENT_MAX_LINES,
+                uid: str | None = None) -> dict:
     """
-    把"新被裁掉的那一段"并进纪要。
+    把该 id 还没纪要过的历史，追加进滚动纪要。
 
-    返回统计，供日志/面板显示。没有任何新内容时 skipped=True，不写盘。
+    只追加、不覆盖、不合并重写；没有新内容时 skipped=True，不写盘。
     """
     from .refine import chunk_events
 
@@ -283,14 +393,10 @@ async def build(llm_call: LLMCall, events: list[dict], store: SummaryStore,
         result["error"] = "没有可纪要的内容"
         return result
 
-    end = boundary_index(events, boundary_fp, keep_recent=keep_recent)
-    if end <= 0:
-        result["error"] = "边界太靠前，没有可纪要的内容"
-        return result
-
-    previous = store.load(session)
-    start = _covered_start(events, previous.get("covered_fp", ""), end)
-    fresh = events[start:end]
+    previous = store.load(uid)
+    start = _covered_start(events, previous.get("covered_fp", ""),
+                           previous.get("covered_index", 0))
+    fresh = events[start:]
     if not fresh:
         result.update({"ok": True, "skipped": True,
                        "chars": len(str(previous.get("text", "")))})
@@ -298,73 +404,55 @@ async def build(llm_call: LLMCall, events: list[dict], store: SummaryStore,
 
     batches = chunk_events(fresh, chunk_chars=max(500, int(chunk_chars or 6000)))
     segments: list[str] = []
-    failed = 0
+    cached = 0
 
     for batch in batches:
         cache_key = cache.key(batch, max_lines) if cache is not None else ""
         if cache is not None:
             hit = cache.get(cache_key)
             if hit is not None:
-                segments.append(hit)
-                result["cached"] += 1
+                if hit.strip():
+                    segments.append(hit)
+                cached += 1
                 continue
         try:
             raw = await llm_call(build_segment_prompt(batch, max_lines=max_lines))
         except Exception:
-            failed += 1
-            continue
+            result["error"] = "有些批次失败，旧纪要保留，下次重试"
+            return result
         text = normalize_lines(raw, max_lines=max_lines)
-        if not text:
-            continue
-        segments.append(text)
-        if cache is not None:
-            cache.put(cache_key, text)
+        if text:
+            segments.append(text)
+            if cache is not None:
+                cache.put(cache_key, text)
 
     result["batches"] = len(batches)
+    result["cached"] = cached
     if not segments:
-        result["error"] = "所有批次都失败，旧纪要保留"
+        result["error"] = "模型没有生成纪要内容，旧纪要保留"
         return result
 
-    new_text = "\n".join(segments)
+    new_text = "\n".join(segments).strip()
     old_text = str(previous.get("text", "")).strip()
-
-    # 首次就超过上限时也要压一次，不能硬截——硬截会把最靠后的（最近的）内容切掉
-    if old_text or len(new_text) > max_chars:
-        try:
-            merged_raw = await llm_call(
-                build_merge_prompt(old_text, new_text, max_chars=max_chars))
-        except Exception:
-            if old_text:
-                # 合并失败不清空：旧的留着，新的不写，下次再来
-                result["error"] = "合并失败，旧纪要保留"
-                return result
-            merged = new_text
-        else:
-            merged = normalize_lines(merged_raw, max_lines=0).strip()
-            if not merged:
-                result["error"] = "合并结果为空，旧纪要保留"
-                return result
-    else:
-        merged = new_text
-
-    if len(merged) > max_chars:
-        merged = merged[:max_chars].rstrip() + "…"
+    merged = clean_text((old_text + "\n" + new_text).strip() if old_text else new_text)
 
     last = fresh[-1]
     payload = {
-        "session": session,
+        "uid": store.uid,
         "text": merged,
         "chars": len(merged),
         "covered_fp": str(last.get("fp", "")),
+        "covered_index": len(events),
         "covered_until": str(last.get("ts", "")),
         "updated_at": _now_iso(),
         "version": int(previous.get("version", 0) or 0) + 1,
-        "batches": (int(previous.get("batches", 0) or 0) + len(batches)),
+        "batches": int(previous.get("batches", 0) or 0) + len(batches),
+        "prompt_version": PROMPT_VERSION,
     }
-    store.save(session, payload)
+    store.save(payload, uid)
 
     result.update({"ok": True, "skipped": False, "chars": len(merged),
-                   "written": True, "failed_batches": failed,
-                   "covered_until": payload["covered_until"],
+                   "written": True, "covered_until": payload["covered_until"],
+                   "covered_index": payload["covered_index"],
                    "version": payload["version"]})
     return result
