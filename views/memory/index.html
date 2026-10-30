@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>全量记忆体</title>
-  <link rel="stylesheet" href="./style.css?v=1.0.0" />
+  <link rel="stylesheet" href="./style.css?v=1.3.0" />
 </head>
 <body>
   <header class="topbar">
@@ -20,6 +20,7 @@
       <button id="btn-refine" class="ghost">提炼事实</button>
       <button id="btn-import" class="ghost">导入备份</button>
       <button id="btn-verify-m" class="ghost" title="校验当前数据的 manifest 与完整性">校验记忆体</button>
+      <button id="btn-models" class="ghost" title="可选：下载并启用本地向量模型">向量模型</button>
       <button id="btn-export" class="primary">一键保存全量数据</button>
     </div>
   </header>
@@ -51,7 +52,9 @@
         <button id="btn-download" class="icon-btn" title="下载勾选的会话" disabled>↓</button>
       </div>
       <ul id="session-list" class="session-list"></ul>
+      <div id="session-pager" class="pager" hidden></div>
       <ul id="fact-list" class="session-list fact-list" hidden></ul>
+      <div id="fact-pager" class="pager" hidden></div>
     </aside>
 
     <div class="stack">
@@ -139,7 +142,44 @@
     </div>
   </div>
 
+  <div id="model-modal" class="modal" hidden>
+    <div class="modal-box model-box">
+      <h3>本地向量模型</h3>
+      <p class="hint">
+        默认使用内置哈希向量，不下载任何模型。<br />
+        选择模型后先下载，下载完成再启用；启用后会在后台重建全量向量。
+      </p>
+      <div class="tabs" id="model-source">
+        <button data-source="local" class="tab active" type="button">本地模型</button>
+        <button data-source="api" class="tab" type="button">API Provider</button>
+      </div>
+      <div id="model-api-box" hidden>
+        <label class="model-dir-label">
+          Embedding Provider
+          <select id="model-provider"></select>
+        </label>
+        <p class="hint">使用 AstrBot 里 provider_type=embedding 的 Provider，不下载本地模型。</p>
+      </div>
+      <div id="model-local-box">
+        <div id="model-list" class="model-list"></div>
+        <label class="model-dir-label">
+          下载根目录
+          <input id="model-dir" type="text" placeholder="默认：all_memory_models" />
+        </label>
+      </div>
+      <div class="row">
+        <button id="btn-model-deps" class="ghost">安装依赖</button>
+        <button id="btn-model-download" class="primary">下载</button>
+        <button id="btn-model-enable" class="ghost" disabled>启用</button>
+        <button id="btn-model-disable" class="ghost">停用</button>
+        <button id="btn-model-close" class="ghost">关闭</button>
+      </div>
+      <div id="model-progress" class="model-progress"></div>
+      <pre id="model-result" class="result"></pre>
+    </div>
+  </div>
+
   <div id="toast" class="toast" hidden></div>
-  <script type="module" src="./app.js?v=1.1.0"></script>
+  <script type="module" src="./app.js?v=1.3.0"></script>
 </body>
 </html>

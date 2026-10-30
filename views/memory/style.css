@@ -103,6 +103,26 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 
 .session-list { list-style: none; margin: 0; padding: 6px; }
 
+/* ---------- 列表分页 ---------- */
+
+.pager {
+  flex: 0 0 auto;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 6px; padding: 6px 9px; border-top: 1px solid var(--line);
+  color: var(--muted); font-size: 11px;
+}
+.pager[hidden] { display: none; }
+.pager:empty { display: none; }
+.pager button {
+  padding: 2px 8px; border-radius: 7px; font-size: 11px;
+  background: transparent; border: 1px solid var(--line); color: var(--text);
+}
+.pager button:disabled { opacity: .35; cursor: default; }
+.pager .pager-info {
+  flex: 1 1 auto; text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .tabs { display: flex; gap: 6px; margin-bottom: 7px; }
 .tab {
   padding: 3px 10px; border-radius: 999px; font-size: 12px;
@@ -238,6 +258,11 @@ button.warn { border-color: var(--warn); color: var(--warn); }
   box-shadow: 0 16px 48px rgba(0, 0, 0, .6);
 }
 .modal-box input[type="text"] { width: 100%; margin: 8px 0 10px; }
+.modal-box select {
+  width: 100%; margin: 8px 0 10px; padding: 7px 10px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; color: var(--text); font: inherit;
+}
 .modal-box .row { display: flex; gap: 8px; flex-wrap: wrap; }
 .result {
   margin: 10px 0 0; padding: 10px; max-height: 220px; overflow: auto;
@@ -246,6 +271,29 @@ button.warn { border-color: var(--warn); color: var(--warn); }
   color: var(--muted);
 }
 .result:empty { display: none; }
+
+/* ---------- 本地模型市场 ---------- */
+
+.model-box { width: min(760px, 100%); }
+.model-list { display: grid; gap: 7px; margin: 10px 0; }
+.model-card {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 9px 10px; border: 1px solid var(--line);
+  border-radius: 9px; cursor: pointer;
+  background: var(--panel-2);
+}
+.model-card.active { border-color: var(--accent); }
+.model-card input { margin-top: 3px; accent-color: var(--accent); }
+.model-card .model-name { font-size: 13px; font-weight: 600; }
+.model-card .model-desc { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.model-card .model-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.model-dir-label { display: block; color: var(--muted); font-size: 12px; }
+.model-progress {
+  margin-top: 10px; padding: 7px 9px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  color: var(--muted); font-size: 12px; white-space: pre-wrap;
+}
+.model-progress:empty { display: none; }
 
 /* ---------- 右侧面板栈（会话 / 事实二选一） ---------- */
 

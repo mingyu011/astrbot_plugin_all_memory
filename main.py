@@ -14,6 +14,7 @@ import os
 import io
 import time
 import json
+import inspect
 import sqlite3
 import base64
 import zipfile
@@ -37,6 +38,7 @@ from .core import summary as summary_mod
 from .core import query as query_mod
 from .core import search as search_mod
 from .core import vectors as vectors_mod
+from .core import local_models
 from .core.tokens import Calibrator, estimate_tokens, usage_input_tokens
 from .web_api import WebApi
 
@@ -96,9 +98,12 @@ class AllMemory(Star):
         self.vault = vault_mod.Vault(self.root)
         self.index = index_mod.Index(self.root)
         self.ids = SessionIds(self.root)
-        # 检索：字面（index）+ 向量（vectors）两路，由 search.combine 融合
+        # 检索：字面（index）+ 向量（vectors）两路，由 search.combine 融合。
+        # 默认永远是本地哈希；本地 ONNX 模型是可选的，失败自动退回哈希。
+        self.local_models = local_models.LocalModelManager(self.root)
         self.embedder = vectors_mod.LocalEmbedder()
         self.vectors = vectors_mod.VectorStore(self.root, self.embedder.name)
+        self._local_model_task = None
         # 向量不是"配置项"，是自动补的：启动后补历史，每轮结束补增量
         self._vector_started: set[str] = set()
         # 附件同理：库里一张图都没有时，自动从宿主库回填一次
@@ -120,6 +125,9 @@ class AllMemory(Star):
         self._pending_turn: dict[str, dict] = {}
         # 这一轮最后一条助手消息的指纹：回复里追加的图片/语音挂它身上
         self._last_assistant_fp: dict[str, str] = {}
+
+        # 如果之前启用过本地模型，启动时尝试加载；失败自动停在哈希向量。
+        self._load_active_local_model()
 
         # WebUI：老版本没有 register_web_api，自动跳过，不影响其它功能
         self.web = WebApi(self)
@@ -334,6 +342,204 @@ class AllMemory(Star):
             sessions += int(stats.get("sessions") or 0)
             chars += int(stats.get("chars") or 0)
         return {"sessions": sessions, "chars": chars}
+
+    # ------------------------------------------------------------ 本地向量模型
+
+    def _load_active_local_model(self) -> bool:
+        """启动时恢复上次启用的向量来源；失败不抛，继续用哈希。"""
+        if not self.local_models.enabled:
+            return False
+        if self.local_models.source == "api":
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._restore_api_embedder())
+            except RuntimeError:
+                return False
+            return False
+        if not self.local_models.active_id:
+            return False
+        model_id = self.local_models.active_id
+        try:
+            embedder = self.local_models.enable(model_id)
+            self._apply_embedder(embedder)
+            logger.info(f"[all_memory] 已加载本地向量模型：{model_id}")
+            return True
+        except Exception as exc:
+            logger.warning(
+                f"[all_memory] 本地向量模型加载失败，继续用哈希向量：{exc}")
+            return False
+
+    def _apply_embedder(self, embedder) -> None:
+        self.embedder = embedder
+        self.vectors = vectors_mod.VectorStore(self.root, embedder.name)
+        self._vector_started.clear()
+
+    async def _restore_api_embedder(self) -> None:
+        provider_id = self.local_models.provider_id
+        provider = await self._resolve_embedding_provider(provider_id)
+        if provider is None:
+            logger.warning(
+                f"[all_memory] API 向量 Provider 不可用：{provider_id or '(auto)'}")
+            return
+        try:
+            from .core.local_embed import ProviderEmbedder
+            embedder = ProviderEmbedder(
+                provider, provider_id, asyncio.get_running_loop())
+            self._apply_embedder(embedder)
+            logger.info(f"[all_memory] 已加载 API 向量 Provider：{provider_id}")
+        except Exception as exc:
+            logger.warning(f"[all_memory] API 向量加载失败：{exc}")
+
+    @staticmethod
+    def _has_embedding(provider) -> bool:
+        return any(callable(getattr(provider, name, None))
+                   for name in ("get_embedding", "get_embeddings",
+                                "get_embeddings_batch"))
+
+    @staticmethod
+    async def _maybe_await(value):
+        return await value if inspect.isawaitable(value) else value
+
+    @staticmethod
+    def _provider_info(provider) -> dict:
+        config = getattr(provider, "provider_config", {}) or {}
+        provider_id = str(config.get("id") or "")
+        if not provider_id:
+            try:
+                provider_id = str(provider.meta().id)
+            except Exception:
+                provider_id = ""
+        model = ""
+        try:
+            model = str(provider.get_model() or "")
+        except Exception:
+            model = str(config.get("embedding_model") or "")
+        return {
+            "id": provider_id,
+            "name": str(config.get("name") or config.get("display_name")
+                        or provider_id or "Embedding Provider"),
+            "model": model,
+        }
+
+    async def _resolve_embedding_provider(self, provider_id: str = ""):
+        for getter_name in ("get_embedding_provider_by_id", "get_provider_by_id"):
+            getter = getattr(self.context, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                provider = await self._maybe_await(getter(provider_id))
+            except Exception:
+                provider = None
+            if provider is not None and self._has_embedding(provider):
+                return provider
+        for getter_name in ("get_all_embedding_providers", "get_all_providers"):
+            getter = getattr(self.context, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                values = await self._maybe_await(getter())
+            except Exception:
+                continue
+            if isinstance(values, dict):
+                values = list(values.values())
+            for provider in values or []:
+                if not self._has_embedding(provider):
+                    continue
+                info = self._provider_info(provider)
+                if not provider_id or info["id"] == provider_id:
+                    return provider
+        return None
+
+    async def _embedding_providers(self) -> list[dict]:
+        out: list[dict] = []
+        seen: set[str] = set()
+        for getter_name in ("get_all_embedding_providers", "get_all_providers"):
+            getter = getattr(self.context, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                values = await self._maybe_await(getter())
+            except Exception:
+                continue
+            if isinstance(values, dict):
+                values = list(values.values())
+            for provider in values or []:
+                if not self._has_embedding(provider):
+                    continue
+                info = self._provider_info(provider)
+                if not info["id"] or info["id"] in seen:
+                    continue
+                seen.add(info["id"])
+                out.append(info)
+        return out
+
+    async def model_market(self) -> dict:
+        data = self.local_models.status()
+        data["providers"] = await self._embedding_providers()
+        data["active_embedder"] = self.embedder.name
+        source = self.local_models.source if self.local_models.enabled else "hash"
+        data["source"] = source
+        data["provider_id"] = self.local_models.provider_id
+        for item in data.get("models") or []:
+            item["active"] = bool(
+                item.get("active") and source == "local"
+                and str(self.embedder.name) == f"onnx-{item.get('id')}")
+        data["api_active"] = bool(
+            source == "api"
+            and str(self.embedder.name)
+            == f"api-{self.local_models.provider_id}")
+        data["rebuilding"] = bool(
+            self._local_model_task and not self._local_model_task.done())
+        return data
+
+    def start_model_download(self, model_id: str, parent: str = "") -> dict:
+        return self.local_models.start_download(model_id, parent)
+
+    async def enable_local_model(self, model_id: str) -> dict:
+        try:
+            embedder = await asyncio.to_thread(
+                self.local_models.enable, model_id)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        self._apply_embedder(embedder)
+        if self._local_model_task and not self._local_model_task.done():
+            return {"ok": True, "model": model_id, "message": "模型已启用，正在重建向量"}
+        self._local_model_task = asyncio.create_task(self._rebuild_vectors_async())
+        return {"ok": True, "model": model_id,
+                "message": "模型已启用，正在后台重建全量向量"}
+
+    async def enable_api_embedder(self, provider_id: str) -> dict:
+        provider = await self._resolve_embedding_provider(provider_id)
+        if provider is None:
+            return {"ok": False, "error": "找不到可用的 embedding provider"}
+        try:
+            from .core.local_embed import ProviderEmbedder
+            embedder = ProviderEmbedder(
+                provider, provider_id, asyncio.get_running_loop())
+            self.local_models.set_api(provider_id)
+            self._apply_embedder(embedder)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        if self._local_model_task and not self._local_model_task.done():
+            return {"ok": True, "provider_id": provider_id,
+                    "message": "API 向量已启用，正在重建向量"}
+        self._local_model_task = asyncio.create_task(self._rebuild_vectors_async())
+        return {"ok": True, "provider_id": provider_id,
+                "message": "API 向量已启用，正在后台重建全量向量"}
+
+    async def _rebuild_vectors_async(self) -> None:
+        try:
+            total = await asyncio.to_thread(
+                self.vectors.rebuild, self.vault, self.embedder)
+            logger.info(
+                f"[all_memory] 向量重建完成：{total} 条（{self.embedder.name}）")
+        except Exception as exc:
+            logger.warning(f"[all_memory] 向量重建失败，继续用字面召回：{exc}")
+
+    def disable_local_model(self) -> dict:
+        self.local_models.disable()
+        self._apply_embedder(vectors_mod.LocalEmbedder())
+        return {"ok": True, "message": "已停用向量模型，回到内置哈希向量"}
 
     # ------------------------------------------------------------ 主钩子
 
@@ -920,14 +1126,23 @@ class AllMemory(Star):
         导出时要打包的 (源目录, 包内前缀, 该源跳过的子树)。
 
         跳过列表必须按来源分开，否则插件数据会被跳过或重复打包。
+        本地向量模型是运行时资源，不进记忆备份；默认目录和用户自定义目录都跳过。
         """
         exports = os.path.abspath(os.path.join(self.root, "exports"))
-        targets: list[tuple] = [(self.root, "all_memory", (exports,))]
+        model_skips = {local_models.default_model_parent(self.root)}
+        for model in local_models.MODELS:
+            path = self.local_models.path_of(model["id"])
+            if path:
+                model_skips.add(os.path.abspath(path))
+        model_skips = tuple(sorted(model_skips))
+        targets: list[tuple] = [
+            (self.root, "all_memory", (exports, *model_skips))]
 
         if self._cfg("backup_astrbot_data"):
             data_root = self.astrbot_data_root()
             if data_root:
-                targets.append((data_root, "astrbot_data", (self.root,)))
+                targets.append(
+                    (data_root, "astrbot_data", (self.root, *model_skips)))
             else:
                 logger.warning("[all_memory] 找不到 AstrBot 数据目录，跳过整目录备份")
         return targets

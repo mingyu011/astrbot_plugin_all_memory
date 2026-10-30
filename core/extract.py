@@ -28,7 +28,6 @@ from .ids import safe_component
 from .vault import fp_of, now
 from .tokens import estimate_tokens
 
-MAX_FACTS = 400          # 常驻事实上限，防止索引块无限膨胀
 MAX_CLAIM_CHARS = 120    # 单条事实长度上限
 
 # 事实分类与权重：身份类永远排在最前面，一次性的小事排最后
@@ -325,9 +324,6 @@ class FactStore:
             self._write(existing)
             return existing["id"]
 
-        if len(self.all_facts()) >= MAX_FACTS:
-            self._evict_one()
-
         fact_id = _new_id()
         self._write({
             "id": fact_id,
@@ -423,14 +419,6 @@ class FactStore:
 
         return {"ok": True, "facts": len(facts), "groups": len(groups),
                 "merged": merged}
-
-    def _evict_one(self) -> None:
-        """满了就淘汰最久没更新的一条（它仍在原始层里，可以重新提炼）。"""
-        facts = self.all_facts()
-        if not facts:
-            return
-        facts.sort(key=lambda f: str((f.get("versions") or [{}])[-1].get("extracted_at", "")))
-        self.delete(facts[0]["id"])
 
 
 # ------------------------------------------------------------------ 抽取

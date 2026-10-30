@@ -66,6 +66,12 @@ class WebApi:
             ("summary/status", self.summary_status, ["GET"], "纪要进度"),
             ("verify_m", self.verify_m, ["GET", "POST"], "校验记忆体"),
             ("manifest", self.manifest, ["GET", "POST"], "生成 manifest"),
+            ("models", self.model_market, ["GET"], "本地模型市场"),
+            ("models/install_deps", self.model_install_deps, ["GET", "POST"], "安装本地模型依赖"),
+            ("models/download", self.model_download, ["GET", "POST"], "下载本地模型"),
+            ("models/enable", self.model_enable, ["GET", "POST"], "启用本地模型"),
+            ("models/enable_api", self.model_enable_api, ["GET", "POST"], "启用 API 向量"),
+            ("models/disable", self.model_disable, ["GET", "POST"], "停用本地模型"),
             ("export", self.export, ["GET", "POST"], "打包全量数据"),
             # 单段路径：子路径在某些宿主版本上匹配不到，这里保留两种写法
             ("sessionexport", self.session_export, ["GET", "POST"], "下载选中的会话"),
@@ -461,6 +467,87 @@ class WebApi:
             })
         except Exception as exc:
             logger.warning(LOG + f"生成 manifest 失败: {exc}")
+            return error_response(str(exc))
+
+    # ------------------------------------------------------------ 本地模型市场
+
+    async def model_market(self):
+        try:
+            return json_response(await self.plugin.model_market())
+        except Exception as exc:
+            logger.warning(LOG + f"读取本地模型市场失败: {exc}")
+            return error_response(str(exc))
+
+    async def _model_payload(self) -> dict:
+        payload = {}
+        try:
+            data = await request.json(default={})
+            if isinstance(data, dict):
+                payload = data
+        except Exception:
+            payload = {}
+        model_id = str(payload.get("model")
+                       or request.query.get("model", "", type=str) or "").strip()
+        provider_id = str(payload.get("provider_id")
+                          or request.query.get("provider_id", "", type=str)
+                          or "").strip()
+        parent = str(payload.get("parent")
+                     or request.query.get("parent", "", type=str) or "").strip()
+        return {"model": model_id, "provider_id": provider_id, "parent": parent}
+
+    async def model_install_deps(self):
+        try:
+            info = await asyncio.to_thread(
+                self.plugin.local_models.start_dependency_install)
+            if not info.get("ok"):
+                return error_response(info.get("error") or "安装启动失败")
+            return json_response(info)
+        except Exception as exc:
+            logger.warning(LOG + f"安装本地模型依赖失败: {exc}")
+            return error_response(str(exc))
+
+    async def model_download(self):
+        try:
+            data = await self._model_payload()
+            info = await asyncio.to_thread(
+                self.plugin.start_model_download,
+                data["model"], data["parent"])
+            if not info.get("ok"):
+                return error_response(info.get("error") or "下载启动失败")
+            return json_response(info)
+        except Exception as exc:
+            logger.warning(LOG + f"启动模型下载失败: {exc}")
+            return error_response(str(exc))
+
+    async def model_enable(self):
+        try:
+            data = await self._model_payload()
+            info = await self.plugin.enable_local_model(data["model"])
+            if not info.get("ok"):
+                return error_response(info.get("error") or "启用失败")
+            return json_response(info)
+        except Exception as exc:
+            logger.warning(LOG + f"启用本地模型失败: {exc}")
+            return error_response(str(exc))
+
+    async def model_enable_api(self):
+        try:
+            data = await self._model_payload()
+            provider_id = str(data.get("provider_id") or data.get("model") or "")
+            info = await self.plugin.enable_api_embedder(provider_id)
+            if not info.get("ok"):
+                return error_response(info.get("error") or "启用失败")
+            return json_response(info)
+        except Exception as exc:
+            logger.warning(LOG + f"启用 API 向量失败: {exc}")
+            return error_response(str(exc))
+
+    async def model_disable(self):
+        try:
+            return json_response(
+                await asyncio.to_thread(self.plugin.disable_local_model))
+        except Exception as exc:
+            logger.warning(LOG + f"停用本地模型失败: {exc}")
             return error_response(str(exc))
 
     # ------------------------------------------------------------ 导出

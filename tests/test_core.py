@@ -2725,6 +2725,68 @@ def test_summary_repair_and_covered_index():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_local_model_registry_and_status():
+    """模型市场：四个 BGE 模型、默认第一个、安装状态按文件判断。"""
+    from core import local_models
+
+    assert [item["id"] for item in local_models.MODELS] == [
+        "bge-small-zh-v1.5", "bge-base-zh-v1.5",
+        "bge-large-zh-v1.5", "bge-m3"]
+    assert local_models.DEFAULT_MODEL == "bge-small-zh-v1.5"
+
+    root = _tmp()
+    sibling = local_models.default_model_parent(root)
+    shutil.rmtree(sibling, ignore_errors=True)
+    try:
+        manager = local_models.LocalModelManager(root)
+        data = manager.status()
+        assert len(data["models"]) == 4
+        assert data["models"][0]["installed"] is False
+        target = local_models.model_dir(root, "bge-small-zh-v1.5")
+        for rel in local_models.model_files("bge-small-zh-v1.5"):
+            path = os.path.join(target, rel.replace("/", os.sep))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(b"x")
+        manager.set_path("bge-small-zh-v1.5", target)
+        data = manager.status("bge-small-zh-v1.5")
+        assert data["model"]["installed"] is True
+        manager.set_api("provider-1")
+        assert manager.enabled is True
+        assert manager.source == "api"
+        assert manager.provider_id == "provider-1"
+        manager.disable()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(sibling, ignore_errors=True)
+
+
+def test_factstore_keeps_growing_without_eviction():
+    """事实不再按 400 条硬上限淘汰；注入由预算选择。"""
+    root = _tmp()
+    try:
+        store = extract.FactStore(root, "u1")
+        for index in range(405):
+            store._write({
+                "id": f"f-{index:03d}",
+                "scope": "people",
+                "deleted": False,
+                "versions": [{
+                    "version": 1,
+                    "claim": f"第 {index} 条长期事实",
+                    "kind": "fact",
+                    "source_fp": [f"src-{index}"],
+                    "extracted_at": "2026-10-30T00:00:00+08:00",
+                }],
+            })
+        assert len(store.all_facts()) == 405
+        store.upsert("用户的猫叫咪咪", ["src-new"])
+        assert len(store.all_facts()) == 406
+        assert store.load("f-000") is not None, "旧事实不能因为数量被淘汰"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_factstore_fuzzy_merge_and_repair():
     root = _tmp()
     try:

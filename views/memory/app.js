@@ -20,6 +20,16 @@ const state = {
   facts: [],
   factFilter: "",
   fact: null,
+  sessionPage: 1,
+  factPage: 1,
+  models: [],
+  modelData: null,
+  modelId: "",
+  modelSource: "local",
+  modelSourceReady: false,
+  providerId: "",
+  modelPoll: null,
+  modelBusy: false,
   // 全局接管状态：auto / on / off（对所有会话生效）
   takeover: "auto",
   // 右侧历史面板顶部的纪要是否展开
@@ -28,6 +38,8 @@ const state = {
   // 用户往上翻就变 false，图片加载完也不会把他拽回去。
   stickBottom: true,
 };
+
+const PAGE_SIZE = 100;
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => {
@@ -126,30 +138,72 @@ async function loadSessions() {
   try {
     const data = unwrap(await apiGet("sessions"));
     state.sessions = Array.isArray(data.items) ? data.items : [];
+    state.sessionPage = 1;
     renderSessions();
   } catch (err) {
     toast(err.message, true);
   }
 }
 
-function renderSessions() {
-  const list = $("session-list");
-  list.replaceChildren();
-
+function filteredSessions() {
   const keyword = state.filter.trim().toLowerCase();
-  const items = state.sessions.filter((item) => {
+  return state.sessions.filter((item) => {
     if (state.kind !== "all" && item.kind !== state.kind) return false;
     if (!keyword) return true;
     return `${item.session} ${item.sample}`.toLowerCase().includes(keyword);
   });
+}
+
+function clampPage(page, total) {
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  return Math.min(Math.max(1, Number(page) || 1), pages);
+}
+
+function renderPager(id, total, page, setPage) {
+  const box = $(id);
+  if (!box) return;
+  const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if (pages <= 1) {
+    box.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  box.hidden = false;
+  box.replaceChildren();
+
+  const prev = el("button", "", "上一页");
+  prev.type = "button";
+  prev.disabled = page <= 1;
+  prev.addEventListener("click", () => setPage(page - 1));
+
+  const next = el("button", "", "下一页");
+  next.type = "button";
+  next.disabled = page >= pages;
+  next.addEventListener("click", () => setPage(page + 1));
+
+  box.append(prev,
+    el("span", "pager-info",
+      `第 ${page} / ${pages} 页 · 共 ${total} 条 · 每页 ${PAGE_SIZE} 条`),
+    next);
+}
+
+function renderSessions() {
+  const list = $("session-list");
+  list.replaceChildren();
+
+  const items = filteredSessions();
+  state.sessionPage = clampPage(state.sessionPage, items.length);
 
   if (!items.length) {
     list.append(el("li", "empty", "没有匹配的会话"));
     syncSelectionUI(items);
+    renderPager("session-pager", 0, 1, () => {});
     return;
   }
 
-  for (const item of items) {
+  const start = (state.sessionPage - 1) * PAGE_SIZE;
+  const pageItems = items.slice(start, start + PAGE_SIZE);
+  for (const item of pageItems) {
     const li = el("li");
     if (state.session === item.session) li.classList.add("active");
 
@@ -180,6 +234,11 @@ function renderSessions() {
   }
 
   syncSelectionUI(items);
+  renderPager("session-pager", items.length, state.sessionPage, (page) => {
+    state.sessionPage = page;
+    renderSessions();
+    $("session-list").scrollTop = 0;
+  });
 }
 
 function syncSelectionUI(items) {
@@ -621,29 +680,38 @@ async function loadFacts() {
   try {
     const data = unwrap(await apiGet("facts"));
     state.facts = Array.isArray(data.items) ? data.items : [];
+    state.factPage = 1;
     renderFacts();
   } catch (err) {
     toast(err.message, true);
   }
 }
 
+function filteredFacts() {
+  const keyword = state.factFilter.trim().toLowerCase();
+  return state.facts.filter((item) => {
+    if (!keyword) return true;
+    return `${item.claim} ${item.kind} ${item.id} ${item.uid || ""}`.toLowerCase().includes(keyword);
+  });
+}
+
 function renderFacts() {
   const list = $("fact-list");
   list.replaceChildren();
 
-  const keyword = state.factFilter.trim().toLowerCase();
-  const items = state.facts.filter((item) => {
-    if (!keyword) return true;
-    return `${item.claim} ${item.kind} ${item.id} ${item.uid || ""}`.toLowerCase().includes(keyword);
-  });
+  const items = filteredFacts();
+  state.factPage = clampPage(state.factPage, items.length);
 
   if (!items.length) {
     list.append(el("li", "empty",
       state.facts.length ? "没有匹配的事实" : "还没有提炼出任何事实，点右上角「提炼事实」"));
+    renderPager("fact-pager", 0, 1, () => {});
     return;
   }
 
-  for (const item of items) {
+  const start = (state.factPage - 1) * PAGE_SIZE;
+  const pageItems = items.slice(start, start + PAGE_SIZE);
+  for (const item of pageItems) {
     const li = el("li");
     if (state.fact && state.fact.id === item.id) li.classList.add("active");
 
@@ -665,6 +733,12 @@ function renderFacts() {
     li.addEventListener("click", () => selectFact(item));
     list.append(li);
   }
+
+  renderPager("fact-pager", items.length, state.factPage, (page) => {
+    state.factPage = page;
+    renderFacts();
+    $("fact-list").scrollTop = 0;
+  });
 }
 
 async function selectFact(item) {
@@ -833,6 +907,8 @@ function setMode(mode) {
   $("fact-search").hidden = !facts;
   $("session-list").hidden = facts;
   $("fact-list").hidden = !facts;
+  $("session-pager").hidden = facts;
+  $("fact-pager").hidden = !facts;
   $("history-panel").hidden = facts;
   $("fact-panel").hidden = !facts;
 
@@ -840,8 +916,9 @@ function setMode(mode) {
     loadFacts().then(() => {
       if (!state.fact && state.facts.length) selectFact(state.facts[0]);
     });
-  } else if (state.session) {
-    loadHistory();
+  } else {
+    renderSessions();
+    if (state.session) loadHistory();
   }
 }
 
@@ -1159,6 +1236,303 @@ async function runImport() {
   }
 }
 
+// ---------------------------------------------------------------- 本地模型市场
+
+function modelById(modelId) {
+  return (state.models || []).find((item) => item.id === modelId) || null;
+}
+
+function renderModelMarket(data) {
+  state.modelData = data;
+  state.models = Array.isArray(data.models) ? data.models : [];
+  const providers = Array.isArray(data.providers) ? data.providers : [];
+  const first = state.models[0] || null;
+  if (!state.modelId || !modelById(state.modelId)) {
+    state.modelId = first ? first.id : "";
+  }
+  if (!state.modelSourceReady) {
+    state.modelSource = data.source === "api" ? "api" : "local";
+    state.modelSourceReady = true;
+  }
+  if (!state.providerId) {
+    state.providerId = data.provider_id || (providers[0] && providers[0].id) || "";
+  }
+  const dir = $("model-dir");
+  if (dir && !dir.value && data.default_parent) dir.value = data.default_parent;
+
+  for (const tab of $("model-source").querySelectorAll(".tab")) {
+    tab.classList.toggle("active", tab.dataset.source === state.modelSource);
+  }
+  const localMode = state.modelSource === "local";
+  $("model-local-box").hidden = !localMode;
+  $("model-api-box").hidden = localMode;
+
+  const list = $("model-list");
+  list.replaceChildren();
+  for (const item of state.models) {
+    const card = document.createElement("label");
+    card.className = `model-card${item.id === state.modelId ? " active" : ""}`;
+
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "model-choice";
+    radio.value = item.id;
+    radio.checked = item.id === state.modelId;
+    radio.addEventListener("change", () => {
+      state.modelId = item.id;
+      renderModelMarket(state.modelData);
+    });
+
+    const box = document.createElement("div");
+    box.append(el("div", "model-name", item.name || item.id));
+    box.append(el("div", "model-desc", item.desc || ""));
+    const tags = el("div", "model-tags");
+    tags.append(el("span", "chip", `${item.dim} 维`));
+    tags.append(el("span", "chip muted", item.size || ""));
+    if (item.installed) tags.append(el("span", "chip", "已下载"));
+    if (item.active) tags.append(el("span", "chip", "当前启用"));
+    if (item.progress && item.progress.status === "downloading") {
+      tags.append(el("span", "chip", `下载中 ${item.progress.percent || 0}%`));
+    }
+    box.append(tags);
+    card.append(radio, box);
+    list.append(card);
+  }
+
+  const select = $("model-provider");
+  select.replaceChildren();
+  if (!providers.length) {
+    select.append(new Option("没有可用的 embedding provider", ""));
+  } else {
+    for (const provider of providers) {
+      const option = new Option(
+        `${provider.name || provider.id}${provider.model ? ` · ${provider.model}` : ""}`,
+        provider.id);
+      select.append(option);
+    }
+    select.value = providers.some((p) => p.id === state.providerId)
+      ? state.providerId : providers[0].id;
+    state.providerId = select.value;
+  }
+
+  const selected = modelById(state.modelId);
+  const busy = state.modelBusy;
+  const depsInstalling = data.dependency_progress
+    && data.dependency_progress.status === "installing";
+  $("btn-model-deps").hidden = !localMode || data.dependencies_ok === true;
+  $("btn-model-deps").disabled = busy || depsInstalling;
+  $("btn-model-deps").textContent = depsInstalling ? "安装中…" : "安装依赖";
+  $("btn-model-download").hidden = !localMode;
+  $("btn-model-download").disabled = busy || !selected
+    || data.dependencies_ok === false;
+  $("btn-model-download").textContent = selected && selected.installed
+    ? "重新下载" : "下载";
+  $("btn-model-enable").disabled = busy || (localMode
+    ? (!selected || !selected.installed || data.dependencies_ok === false)
+    : !state.providerId);
+  $("btn-model-enable").textContent = localMode ? "启用本地" : "启用 API";
+  $("btn-model-disable").disabled = busy || !data.enabled;
+
+  const progress = $("model-progress");
+  const lines = [];
+  if (localMode && data.dependencies_ok === false) {
+    lines.push(data.dependencies_error || "本地模型依赖未安装");
+  }
+  if (data.dependency_progress) {
+    const dep = data.dependency_progress;
+    if (dep.status === "installing") lines.push(dep.message || "正在安装依赖…");
+    if (dep.status === "error") {
+      lines.push(`${dep.message || "依赖安装失败"}\n${dep.error || ""}`);
+    }
+  }
+  if (data.rebuilding) lines.push("正在后台重建向量索引…");
+  if (!localMode) {
+    if (!providers.length) lines.push("没有检测到可用的 embedding provider。");
+    if (data.api_active) lines.push(`当前使用 API Provider：${state.providerId}`);
+  } else if (selected && selected.progress) {
+    const p = selected.progress;
+    lines.push(
+      `${p.status === "downloading" ? "下载中" : p.message || p.status}` +
+      (p.status === "downloading" ? ` · ${p.percent || 0}%` : "") +
+      (p.path ? `\n目录：${p.path}` : "") +
+      (p.error ? `\n错误：${p.error}` : ""));
+  } else if (selected) {
+    lines.push(`${selected.installed ? "已下载" : "未下载"}：${selected.path}`);
+  }
+  progress.textContent = lines.join("\n");
+}
+
+async function loadModelMarket() {
+  try {
+    const data = unwrap(await apiGet("models"));
+    state.modelBusy = Boolean(data.rebuilding) ||
+      (data.dependency_progress
+        && data.dependency_progress.status === "installing") ||
+      (data.models || []).some(
+        (item) => item.progress && item.progress.status === "downloading");
+    renderModelMarket(data);
+    return data;
+  } catch (err) {
+    toast(err.message, true);
+    return null;
+  }
+}
+
+function stopModelPoll() {
+  if (state.modelPoll) {
+    clearInterval(state.modelPoll);
+    state.modelPoll = null;
+  }
+}
+
+function startModelPoll() {
+  if (state.modelPoll) return;
+  state.modelPoll = setInterval(async () => {
+    const data = await loadModelMarket();
+    if (!data) return;
+    if (!state.modelBusy) {
+      stopModelPoll();
+      const active = (data.models || []).find((item) => item.active);
+      if (active) toast(`本地向量模型已启用：${active.name}`);
+    }
+  }, 1500);
+}
+
+async function openModels() {
+  $("model-modal").hidden = false;
+  $("model-result").textContent = "";
+  await loadModelMarket();
+  startModelPoll();
+}
+
+function closeModels() {
+  $("model-modal").hidden = true;
+  stopModelPoll();
+}
+
+async function installModelDeps() {
+  if (!window.confirm(
+    "安装本地模型依赖？\n\n" +
+    "会通过当前 AstrBot 的 Python 安装 onnxruntime、tokenizers、numpy。\n" +
+    "需要联网，可能要一两分钟。")) return;
+  state.modelBusy = true;
+  $("btn-model-deps").disabled = true;
+  $("btn-model-deps").textContent = "安装中…";
+  try {
+    let info;
+    try {
+      info = unwrap(await apiPost("models/install_deps", {}));
+    } catch (postErr) {
+      info = unwrap(await apiGet("models/install_deps", {}));
+    }
+    toast(info.message || "已开始安装依赖");
+    startModelPoll();
+    await loadModelMarket();
+  } catch (err) {
+    state.modelBusy = false;
+    toast(err.message, true);
+    await loadModelMarket();
+  }
+}
+
+async function startModelDownload() {
+  if (state.modelSource !== "local") return;
+  const model = modelById(state.modelId);
+  if (!model) return;
+  const parent = ($("model-dir").value || "").trim();
+  if (!window.confirm(
+    `下载 ${model.name}？\n\n大小：${model.size}\n目录：${parent || "默认目录"}\n\n` +
+    "下载完成后还需要手动点「启用」。")) return;
+
+  state.modelBusy = true;
+  $("btn-model-download").disabled = true;
+  $("btn-model-download").textContent = "启动中…";
+  try {
+    let info;
+    try {
+      info = unwrap(await apiPost("models/download",
+        { model: model.id, parent }));
+    } catch (postErr) {
+      info = unwrap(await apiGet("models/download",
+        { model: model.id, parent }));
+    }
+    toast(info.message || "已开始下载");
+    startModelPoll();
+    await loadModelMarket();
+  } catch (err) {
+    state.modelBusy = false;
+    toast(err.message, true);
+    await loadModelMarket();
+  }
+}
+
+async function enableModel() {
+  if (state.modelSource === "api") {
+    if (!state.providerId) {
+      toast("先选择一个 embedding provider", true);
+      return;
+    }
+    state.modelBusy = true;
+    $("btn-model-enable").disabled = true;
+    try {
+      let info;
+      try {
+        info = unwrap(await apiPost("models/enable_api",
+          { provider_id: state.providerId }));
+      } catch (postErr) {
+        info = unwrap(await apiGet("models/enable_api",
+          { provider_id: state.providerId }));
+      }
+      toast(info.message || "API 向量已启用");
+      startModelPoll();
+      await loadModelMarket();
+    } catch (err) {
+      state.modelBusy = false;
+      toast(err.message, true);
+      await loadModelMarket();
+    }
+    return;
+  }
+  const model = modelById(state.modelId);
+  if (!model || !model.installed) return;
+  state.modelBusy = true;
+  $("btn-model-enable").disabled = true;
+  try {
+    let info;
+    try {
+      info = unwrap(await apiPost("models/enable", { model: model.id }));
+    } catch (postErr) {
+      info = unwrap(await apiGet("models/enable", { model: model.id }));
+    }
+    toast(info.message || "模型已启用");
+    startModelPoll();
+    await loadModelMarket();
+  } catch (err) {
+    state.modelBusy = false;
+    toast(err.message, true);
+    await loadModelMarket();
+  }
+}
+
+async function disableModel() {
+  if (!window.confirm("停用本地向量模型，回到内置哈希向量？\n已有向量不会删除。")) return;
+  state.modelBusy = true;
+  try {
+    let info;
+    try {
+      info = unwrap(await apiPost("models/disable", {}));
+    } catch (postErr) {
+      info = unwrap(await apiGet("models/disable", {}));
+    }
+    toast(info.message || "已停用");
+    await loadModelMarket();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    state.modelBusy = false;
+  }
+}
+
 // ---------------------------------------------------------------- 事件绑定
 
 function bind() {
@@ -1172,6 +1546,7 @@ function bind() {
     const button = event.target.closest(".tab");
     if (!button) return;
     state.kind = button.dataset.kind || "all";
+    state.sessionPage = 1;
     for (const tab of $("tabs").querySelectorAll(".tab")) {
       tab.classList.toggle("active", tab === button);
     }
@@ -1180,11 +1555,13 @@ function bind() {
 
   $("search").addEventListener("input", (event) => {
     state.filter = event.target.value || "";
+    state.sessionPage = 1;
     renderSessions();
   });
 
   $("fact-search").addEventListener("input", (event) => {
     state.factFilter = event.target.value || "";
+    state.factPage = 1;
     renderFacts();
   });
 
@@ -1200,12 +1577,7 @@ function bind() {
 
   $("select-all").addEventListener("change", (event) => {
     const checked = event.target.checked;
-    const keyword = state.filter.trim().toLowerCase();
-    const visible = state.sessions.filter((item) => {
-      if (state.kind !== "all" && item.kind !== state.kind) return false;
-      if (!keyword) return true;
-      return `${item.session} ${item.sample}`.toLowerCase().includes(keyword);
-    });
+    const visible = filteredSessions();
     for (const item of visible) {
       if (checked) state.selected.add(item.session);
       else state.selected.delete(item.session);
@@ -1216,6 +1588,27 @@ function bind() {
   $("btn-summary").addEventListener("click", buildSummary);
   $("btn-takeover").addEventListener("click", toggleTakeover);
   $("btn-session-summary").addEventListener("click", toggleSessionSummary);
+
+  $("btn-models").addEventListener("click", openModels);
+  $("btn-model-close").addEventListener("click", closeModels);
+  $("model-source").addEventListener("click", (event) => {
+    const button = event.target.closest(".tab");
+    if (!button) return;
+    state.modelSource = button.dataset.source === "api" ? "api" : "local";
+    state.modelSourceReady = true;
+    if (state.modelData) renderModelMarket(state.modelData);
+  });
+  $("model-provider").addEventListener("change", (event) => {
+    state.providerId = event.target.value || "";
+    if (state.modelData) renderModelMarket(state.modelData);
+  });
+  $("btn-model-deps").addEventListener("click", installModelDeps);
+  $("btn-model-download").addEventListener("click", startModelDownload);
+  $("btn-model-enable").addEventListener("click", enableModel);
+  $("btn-model-disable").addEventListener("click", disableModel);
+  $("model-modal").addEventListener("click", (event) => {
+    if (event.target === $("model-modal")) closeModels();
+  });
 
   $("btn-import").addEventListener("click", openImport);
   $("btn-import-close").addEventListener("click", closeImport);
