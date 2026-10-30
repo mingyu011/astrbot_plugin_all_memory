@@ -7,6 +7,10 @@
 它不改模型、不改人格，只在上下文快满的时候接手：把旧原文裁掉之前先提炼成人物卡和前情纪要，
 被裁掉的原文仍然留在自己的库里，需要时按关键词或时间查回来（目前只对私聊做优化，群聊无法保证全量数据）。
 
+### 可联动插件：“自主思维”
+
+[`astrbot_plugin_self_thinking`](../astrbot_plugin_self_thinking/README.md)（“自主思维”）负责“什么时候给主 Agent 一次主动开口机会”，本插件负责这次机会里的记忆。
+
 ---
 
 ## ⚠️ 装之前：三件必做的事
@@ -224,6 +228,16 @@ state/__global__/state.json     全局接管开关
 - 本地模型 ONNX 运行需要 `onnxruntime`、`tokenizers`、`numpy`；如果页面显示缺少依赖，直接点同一弹窗里的「安装依赖」，它会用当前 AstrBot 的 Python 安装，不需要手动开终端。
 - API Provider 模式不需要 `onnxruntime`/`tokenizers`，但仍会走网络、计费和隐私边界；记忆原文会发给该 Provider。
 - 模型越大，首次下载和全量索引越慢；默认建议先跑 `bge-small`，确认效果再换。
+
+### 5.2 给自主思维用的接口
+
+「自主思维」（`astrbot_plugin_self_thinking`）主动唤醒主 Agent 前，会通过插件注册表找到本插件，调用：
+
+```text
+compose_proactive_context(session, user_id, query, max_chars)
+```
+
+返回一份只读摘要：前情纪要、长期事实、和当前话题相关的原文。它不经过 `on_llm_request` 管线，也不会修改记忆；没装自主思维时这接口不被调用，原有功能不受影响。
 
 ### 6. 身份：按 id 隔离
 

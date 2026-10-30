@@ -1833,6 +1833,64 @@ class AllMemory(Star):
             anchor_count=5)
         return hits[:max(1, int(limit or 20))]
 
+    async def compose_proactive_context(self, session: str, user_id: str = "",
+                                        query: str = "",
+                                        max_chars: int = 2400) -> str:
+        """给主动唤醒用的记忆摘要。
+
+        自主动思维插件会通过 Star 注册表找到本插件，再调用这里。
+        它不经过 on_llm_request，所以不能复用注入管线；这里只拼一份
+        适合塞进主动提示词的摘要：纪要、长期事实、相关原文。
+        """
+        if not self._cfg("enabled"):
+            return ""
+        session = str(session or "").strip()
+        if not session:
+            return ""
+        try:
+            uid = self.ids.id_for(session)
+            if not uid:
+                uid = self.ids.resolve(session, str(user_id or ""))
+            parts = []
+
+            digest = self.summaries_for(uid).load()
+            summary_text = str(digest.get("text") or "").strip()
+            if summary_text:
+                parts.append("【前情纪要】\n" + summary_text)
+
+            facts = list(self.facts_for(uid).latest().values())
+            claims = []
+            for fact in facts[:60]:
+                claim = str(fact.get("claim") or "").strip()
+                if claim:
+                    claims.append(f"- {claim}")
+            if claims:
+                parts.append("【长期事实】\n" + "\n".join(claims))
+
+            query = str(query or "").strip()
+            if len(query) >= 2:
+                hits = await self.retrieve(query, uid=uid, limit=8,
+                                           use_llm=False)
+                lines = []
+                for hit in hits[:8]:
+                    text = " ".join(str(hit.get("text") or "").split())
+                    if text:
+                        lines.append(
+                            f"- [{hit.get('ts', '')}] {hit.get('role', '')}：{text[:180]}")
+                if lines:
+                    parts.append("【相关原文】\n" + "\n".join(lines))
+
+            if not parts:
+                return ""
+            text = "\n\n".join(parts)
+            limit = max(200, min(int(max_chars or 2400), 8000))
+            if len(text) > limit:
+                text = text[:limit].rstrip() + "\n……（记忆摘要已截断）"
+            return text
+        except Exception as exc:
+            logger.debug(f"[all_memory] 主动记忆摘要失败: {exc}")
+            return ""
+
     def vectorize_recent(self, limit: int = 400, uid: str = "default") -> int:
         """给最近的事件补向量。纯本地计算，几十毫秒，扔后台跑。"""
         try:
